@@ -1,18 +1,19 @@
 :root {
-  --bg: #f4f1ea;
-  --bg-elevated: #fffdf8;
-  --ink: #1a1714;
-  --ink-soft: #4a433c;
-  --muted: #7a7168;
-  --line: rgba(26, 23, 20, 0.1);
-  --line-strong: rgba(26, 23, 20, 0.18);
-  --accent: #0d9f6e;
-  --accent-deep: #087a55;
-  --accent-soft: rgba(13, 159, 110, 0.12);
-  --accent-glow: rgba(13, 159, 110, 0.22);
-  --gold: #c49a3c;
-  --shadow: 0 18px 50px rgba(26, 23, 20, 0.08);
-  --shadow-soft: 0 8px 24px rgba(26, 23, 20, 0.05);
+  color-scheme: dark;
+  --bg: #090909;
+  --bg-elevated: #121212;
+  --ink: #f4f1ea;
+  --ink-soft: #c8c2b8;
+  --muted: #8f877c;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --accent: #2ee6a8;
+  --accent-deep: #22c98f;
+  --accent-soft: rgba(46, 230, 168, 0.14);
+  --accent-glow: rgba(46, 230, 168, 0.34);
+  --gold: #d4a94a;
+  --shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+  --shadow-soft: 0 10px 30px rgba(0, 0, 0, 0.28);
   --radius: 18px;
   --radius-sm: 12px;
   --sans: "DM Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -46,9 +47,9 @@ input {
   inset: 0;
   pointer-events: none;
   background:
-    radial-gradient(circle at 12% 8%, rgba(13, 159, 110, 0.14), transparent 28%),
-    radial-gradient(circle at 88% 0%, rgba(196, 154, 60, 0.12), transparent 24%),
-    linear-gradient(180deg, #f7f4ee 0%, var(--bg) 42%, #efe9df 100%);
+    radial-gradient(circle at 14% 10%, rgba(46, 230, 168, 0.08), transparent 30%),
+    radial-gradient(circle at 86% 0%, rgba(212, 169, 74, 0.06), transparent 24%),
+    linear-gradient(180deg, #0d0d0d 0%, var(--bg) 48%, #050505 100%);
   z-index: -1;
 }
 
@@ -67,12 +68,15 @@ input {
 }
 
 .brand {
-  color: var(--ink);
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  display: inline-flex;
+  align-items: center;
   text-decoration: none;
-  text-transform: uppercase;
+}
+
+.brand img {
+  display: block;
+  width: min(210px, 46vw);
+  height: auto;
 }
 
 .topbar-meta {
@@ -88,7 +92,7 @@ input {
   padding: 8px 12px;
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--ink-soft);
   font-size: 13px;
 }
@@ -202,8 +206,8 @@ input {
 }
 
 .stat-card.accent {
-  border-color: rgba(13, 159, 110, 0.22);
-  background: linear-gradient(180deg, rgba(13, 159, 110, 0.08), rgba(255, 255, 255, 0.9));
+  border-color: rgba(46, 230, 168, 0.28);
+  background: linear-gradient(180deg, rgba(46, 230, 168, 0.1), rgba(18, 18, 18, 0.95));
 }
 
 .stat-card p {
@@ -330,7 +334,7 @@ canvas {
   padding: 28px 30px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.58);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .method-block h3 {
@@ -409,7 +413,7 @@ canvas {
 code {
   padding: 0.12em 0.38em;
   border-radius: 6px;
-  background: rgba(26, 23, 20, 0.06);
+  background: rgba(255, 255, 255, 0.08);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.9em;
 }

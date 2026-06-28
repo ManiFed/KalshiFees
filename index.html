@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Kalshi Fees — Estimated Fee Revenue Dashboard</title>
+    <title>The Supercycle — Kalshi Fee Dashboard</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
@@ -14,7 +14,9 @@
 
     <main class="page">
       <header class="topbar">
-        <a class="brand" href="./">KalshiFees</a>
+        <a class="brand" href="./">
+          <img src="./assets/supercycle-logo.png" alt="The Supercycle" width="210" height="58">
+        </a>
         <div class="topbar-meta">
           <span class="status-pill" id="dataStatus">Loading fee data…</span>
           <label class="upload-link" id="uploadLink" hidden>
@@ -25,7 +27,7 @@
       </header>
 
       <section class="hero">
-        <p class="eyebrow">Independent fee estimates from public Kalshi trade data</p>
+        <p class="eyebrow">The Supercycle · independent Kalshi fee estimates</p>
         <h1>
           <button class="title-control" id="cadenceControl" type="button" aria-haspopup="menu" aria-expanded="false">Daily</button>
           fees
@@ -175,6 +177,6 @@
       <button type="button" data-window="last-month">Last month</button>
     </div>
 
-    <script type="module" src="./app.js?v=20260629"></script>
+    <script type="module" src="./app.js?v=20260629b"></script>
   </body>
 </html>

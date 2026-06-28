@@ -34,14 +34,20 @@ const periodLabels = {
 };
 
 const palette = {
-  accent: '#0d9f6e',
-  accentSoft: 'rgba(13, 159, 110, 0.18)',
-  accentFill: 'rgba(13, 159, 110, 0.28)',
-  ink: '#1a1714',
-  muted: '#7a7168',
-  grid: 'rgba(122, 113, 104, 0.16)',
-  bars: ['#0d9f6e', '#3d6f9b', '#b76b79', '#c49a3c', '#6d5b9a', '#5f8a4b', '#9a6d45'],
+  accent: '#2ee6a8',
+  accentSoft: 'rgba(46, 230, 168, 0.16)',
+  accentFill: 'rgba(46, 230, 168, 0.32)',
+  ink: '#f4f1ea',
+  muted: '#8f877c',
+  grid: 'rgba(255, 255, 255, 0.08)',
+  bars: ['#2ee6a8', '#5b9fd4', '#d47f8f', '#d4a94a', '#9a84d4', '#7fb364', '#c49262'],
 };
+
+const logoImage = new Image();
+logoImage.src = './assets/supercycle-logo.png';
+logoImage.addEventListener('load', () => {
+  if (state.rows.length) render();
+});
 
 const elements = {
   cadenceControl: document.querySelector('#cadenceControl'),
@@ -246,6 +252,7 @@ function drawRevenueChart(canvas, rows, cadence) {
 
   drawAxisLabels(ctx, plot, rows, cadence);
   drawRightAxis(ctx, plot, maxCumulative);
+  drawLogoOverlay(ctx, plot);
 }
 
 function drawCategoryTrendChart(canvas, rows, categories) {
@@ -264,6 +271,7 @@ function drawCategoryTrendChart(canvas, rows, categories) {
   drawArea(ctx, points, plot, palette.accentSoft);
   drawLine(ctx, points, palette.accent, 2.4 * dpr);
   drawAxisLabels(ctx, plot, rows, state.cadence);
+  drawLogoOverlay(ctx, plot);
 }
 
 function drawCategoryChart(canvas, categories) {
@@ -289,7 +297,11 @@ function drawCategoryChart(canvas, categories) {
     ctx.fillText(formatCurrency(value), plot.left + (value / max) * plot.width + 10, y + barHeight / 2);
   });
 
-  if (!data.length) drawEmptyPanel(canvas, 'No category fee columns found');
+  if (!data.length) {
+    drawEmptyPanel(canvas, 'No category fee columns found');
+    return;
+  }
+  drawLogoOverlay(ctx, plot);
 }
 
 function drawRunRateChart(canvas, rows) {
@@ -306,6 +318,7 @@ function drawRunRateChart(canvas, rows) {
   drawArea(ctx, points, plot, palette.accentSoft);
   drawLine(ctx, points, palette.accent, 2.4 * dpr);
   drawAxisLabels(ctx, plot, recent, 'monthly');
+  drawLogoOverlay(ctx, plot);
 }
 
 function setupCanvas(canvas) {
@@ -407,13 +420,29 @@ function drawAxisLabels(ctx, plot, rows, cadence) {
   }
 }
 
+function drawLogoOverlay(ctx, plot) {
+  if (!logoImage.complete || !logoImage.naturalWidth) return;
+  const aspect = logoImage.naturalWidth / logoImage.naturalHeight;
+  const maxWidth = plot.width * 0.42;
+  const width = Math.min(maxWidth, 220);
+  const height = width / aspect;
+  const x = plot.left + (plot.width - width) / 2;
+  const y = plot.top + (plot.height - height) / 2;
+  ctx.save();
+  ctx.globalAlpha = 0.16;
+  ctx.drawImage(logoImage, x, y, width, height);
+  ctx.restore();
+}
+
 function drawEmptyPanel(canvas, message) {
   const { ctx, width, height } = setupCanvas(canvas);
+  const plot = bounds(width, height, { top: 20, right: 20, bottom: 40, left: 20 });
   ctx.fillStyle = palette.muted;
   ctx.font = font(15);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(message, width / 2, height / 2);
+  drawLogoOverlay(ctx, plot);
 }
 
 function xAt(plot, index, length) {
