@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kalshi Fee Revenue Dashboard</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <h1>
+          <button class="title-control" id="cadenceControl" type="button" aria-haspopup="menu" aria-expanded="false">Daily</button>
+          Kalshi data
+          <button class="title-control" id="windowControl" type="button" aria-haspopup="menu" aria-expanded="false">since the first trade</button>
+        </h1>
+        <p>Historical trends and key metrics across Kalshi's prediction markets</p>
+        <div class="data-chip" id="dataNotice" hidden>
+          <span>Sample data</span>
+          <label>
+            Load CSV
+            <input id="fileInput" type="file" accept=".csv,text/csv">
+          </label>
+        </div>
+      </header>
+
+      <section class="stats-grid" aria-label="Fee summary">
+        <article class="stat">
+          <p>Total All-Time Fees</p>
+          <strong id="totalFees">$0</strong>
+          <span id="totalDelta">Across loaded history</span>
+        </article>
+        <article class="stat">
+          <p id="avgLabel">Daily Average Fees</p>
+          <strong id="avgFees">$0</strong>
+          <span id="avgDelta">Mean across active window</span>
+        </article>
+        <article class="stat">
+          <p>Trailing Run Rate</p>
+          <strong id="runRate">$0</strong>
+          <span id="runRateDelta">Annualized from latest month</span>
+        </article>
+        <article class="stat">
+          <p>Highest Fee Day</p>
+          <strong id="highestDay">$0</strong>
+          <span id="highestDate">No data</span>
+        </article>
+      </section>
+
+      <section class="chart-grid">
+        <article class="chart-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Fee Revenue</h2>
+              <p id="revenueSubtitle">Daily fee and cumulative fee over time</p>
+            </div>
+            <span aria-hidden="true">↗</span>
+          </div>
+          <div class="legend">
+            <span><i class="dot green"></i>Period Fees</span>
+            <span><i class="line black"></i>Cumulative Fees</span>
+          </div>
+          <canvas id="revenueChart" height="360" aria-label="Fee revenue chart"></canvas>
+        </article>
+
+        <article class="chart-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Category Fees Over Time</h2>
+              <p>Leading category fee trend in the selected window</p>
+            </div>
+            <span aria-hidden="true">↗</span>
+          </div>
+          <canvas id="categoryChart" height="360" aria-label="Category fee chart"></canvas>
+        </article>
+
+        <article class="chart-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Recent Run Rate</h2>
+              <p>Rolling monthly fee revenue by period</p>
+            </div>
+            <span aria-hidden="true">↗</span>
+          </div>
+          <canvas id="runRateChart" height="320" aria-label="Recent run rate chart"></canvas>
+        </article>
+
+        <article class="chart-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Category Mix</h2>
+              <p>Estimated all-time fee split by market category</p>
+            </div>
+            <span aria-hidden="true">↗</span>
+          </div>
+          <canvas id="mixChart" height="320" aria-label="Category mix chart"></canvas>
+        </article>
+      </section>
+
+      <section class="methodology">
+        <div>
+          <p class="eyebrow">Architecture and methodology</p>
+          <h2>How these estimates are built</h2>
+        </div>
+
+        <div class="method-grid">
+          <article>
+            <h3>Collector Architecture</h3>
+            <p>The data collector is a Python API harvester that loads Kalshi fee multiplier history, enumerates live and historical event markets, fetches candlesticks, estimates fee revenue per candle, adds perpetual futures estimates, and writes daily and monthly CSV files. The static site reads the daily CSV directly in the browser and recomputes dashboard windows, totals, category mixes, cumulative totals, and chart series without a server.</p>
+          </article>
+          <article>
+            <h3>API Inputs</h3>
+            <p>The collector uses Kalshi's public trade API at <code>https://external-api.kalshi.com/trade-api/v2</code>. It calls <code>/exchange/series-fee-changes</code> for per-series taker multiplier history, <code>/markets</code> for open and active markets, <code>/historical/markets</code> for closed markets, live and historical candlestick endpoints for volume and price history, and <code>/margin/markets</code> for perpetual futures market notional estimates.</p>
+          </article>
+          <article>
+            <h3>Event Fee Formula</h3>
+            <p>For each candle, volume is multiplied by a rounded fee-per-contract estimate based on <code>P × (1-P)</code>, where <code>P</code> is the candle mean price when available, then close price as fallback. Before May 1, 2025, the script treats fees as taker-only. From May 1, 2025 onward, it applies a taker fee plus a maker fee set to 25% of the taker multiplier, weighted by the configured maker/taker split.</p>
+          </article>
+          <article>
+            <h3>Multiplier Logic</h3>
+            <p>Series-specific fee multipliers come first from Kalshi's fee-change log. If no API change exists, the script falls back to standard event fees, reduced INX/NASDAQ100-style fees for known prefixes, and a zero-fee exclusion list for <code>KXBTCY</code>, <code>KXCITRINI</code>, and <code>KXDOED</code>. The fee era boundary is applied per candle, which matters for markets crossing the April-to-May 2025 change.</p>
+          </article>
+          <article>
+            <h3>Candle Periods</h3>
+            <p>Markets open for less than 24 hours are fetched with one-minute candles so short-lived sports or event markets are not flattened into a daily bucket. Multi-day markets use daily candles. Historical market requests include a six-hour buffer around open and close times to reduce missing edge activity.</p>
+          </article>
+          <article>
+            <h3>Perpetual Futures</h3>
+            <p>The collector treats perpetual futures separately from event contracts. It estimates revenue from notional volume using default maker and taker basis-point assumptions and excludes funding-rate transfers because those flow between traders rather than to Kalshi. Without daily perp history, the perp estimate is reported as an all-time adjustment and excluded from the daily chart.</p>
+          </article>
+          <article>
+            <h3>Known Approximation</h3>
+            <p>Candle mean price is a time-weighted midpoint proxy, not actual fill-price VWAP. Fee rounding is applied at market-candle granularity, not per individual fill, which can undercount small trades. Maker/taker split is assumed rather than observed. Missing or newly changed zero-fee/reduced-fee series can move the estimate. API gaps, rate limits, schema changes, and authenticated-only fee tiers can also affect completeness.</p>
+          </article>
+          <article>
+            <h3>Dashboard Calculations</h3>
+            <p>The page parses <code>kalshi_fee_daily.csv</code>, normalizes category columns prefixed with <code>cat_</code>, filters by first trade, last year, last six months, or last month, groups rows daily, weekly, or monthly, and recomputes total fees, average period fees, trailing annualized run rate, highest fee day, cumulative line data, and category totals for the visible window.</p>
+          </article>
+          <article>
+            <h3>Credit and Independence</h3>
+            <p>The visual direction is credited to <a href="https://kalshidata.com" target="_blank" rel="noreferrer">kalshidata.com</a>, whose public dashboard style inspired the typography, spacing, underlined title controls, warm background, and chart composition. This project is independent research and is not affiliated with, endorsed by, sponsored by, or approved by Kalshi, KalshiEx LLC, Kalshi Klear LLC, the National Futures Association, the Commodity Futures Trading Commission, or any other exchange, regulator, or self-regulatory organization.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <div class="menu" id="cadenceMenu" role="menu" hidden>
+      <button type="button" data-cadence="daily">Daily</button>
+      <button type="button" data-cadence="weekly">Weekly</button>
+      <button type="button" data-cadence="monthly">Monthly</button>
+    </div>
+    <div class="menu" id="windowMenu" role="menu" hidden>
+      <button type="button" data-window="first-trade">Since the first trade</button>
+      <button type="button" data-window="last-year">Last year</button>
+      <button type="button" data-window="last-6-months">Last 6 months</button>
+      <button type="button" data-window="last-month">Last month</button>
+    </div>
+
+    <script type="module" src="./app.js?v=20260628b"></script>
+  </body>
+</html>
