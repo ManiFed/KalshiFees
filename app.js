@@ -13,7 +13,8 @@ const state = {
   cadence: 'daily',
   window: 'first-trade',
   rows: [],
-  usingSample: false,
+  dataState: 'loading',
+  lastUpdated: '',
 };
 
 const labels = {
@@ -32,14 +33,23 @@ const periodLabels = {
   monthly: 'month',
 };
 
-const colors = ['#20d895', '#4877aa', '#b95f70', '#b88738', '#7660a8', '#6d8f4e', '#9b6a42'];
+const palette = {
+  accent: '#0d9f6e',
+  accentSoft: 'rgba(13, 159, 110, 0.18)',
+  accentFill: 'rgba(13, 159, 110, 0.28)',
+  ink: '#1a1714',
+  muted: '#7a7168',
+  grid: 'rgba(122, 113, 104, 0.16)',
+  bars: ['#0d9f6e', '#3d6f9b', '#b76b79', '#c49a3c', '#6d5b9a', '#5f8a4b', '#9a6d45'],
+};
 
 const elements = {
   cadenceControl: document.querySelector('#cadenceControl'),
   windowControl: document.querySelector('#windowControl'),
   cadenceMenu: document.querySelector('#cadenceMenu'),
   windowMenu: document.querySelector('#windowMenu'),
-  dataNotice: document.querySelector('#dataNotice'),
+  dataStatus: document.querySelector('#dataStatus'),
+  uploadLink: document.querySelector('#uploadLink'),
   fileInput: document.querySelector('#fileInput'),
   totalFees: document.querySelector('#totalFees'),
   totalDelta: document.querySelector('#totalDelta'),
@@ -51,6 +61,7 @@ const elements = {
   highestDay: document.querySelector('#highestDay'),
   highestDate: document.querySelector('#highestDate'),
   revenueSubtitle: document.querySelector('#revenueSubtitle'),
+  categoryTrendLabel: document.querySelector('#categoryTrendLabel'),
   revenueChart: document.querySelector('#revenueChart'),
   categoryChart: document.querySelector('#categoryChart'),
   runRateChart: document.querySelector('#runRateChart'),
@@ -61,17 +72,34 @@ loadData();
 bindMenus();
 
 async function loadData() {
+  setDataStatus('loading', 'Loading fee data…');
   try {
     const response = await fetch('./kalshi_fee_daily.csv', { cache: 'no-store' });
-    if (!response.ok) throw new Error('No local CSV found');
+    if (!response.ok) throw new Error('CSV not found');
     const text = await response.text();
-    state.rows = normalizeRows(parseCsv(text));
-    state.usingSample = false;
+    const parsed = normalizeRows(parseCsv(text));
+    if (!parsed.length) throw new Error('CSV is empty');
+    state.rows = parsed;
+    state.dataState = 'live';
+    state.lastUpdated = parsed.at(-1).date;
+    setDataStatus('live', `Live fee data through ${formatDateLabel(state.lastUpdated)}`);
+    elements.uploadLink.hidden = true;
   } catch {
-    state.rows = normalizeRows(generateSampleRows());
-    state.usingSample = true;
+    state.rows = [];
+    state.dataState = 'error';
+    state.lastUpdated = '';
+    setDataStatus(
+      'error',
+      'Fee data unavailable — waiting for collector output',
+    );
+    elements.uploadLink.hidden = false;
   }
   render();
+}
+
+function setDataStatus(kind, message) {
+  elements.dataStatus.textContent = message;
+  elements.dataStatus.className = `status-pill ${kind}`;
 }
 
 function bindMenus() {
@@ -98,7 +126,10 @@ function bindMenus() {
     const [file] = event.target.files;
     if (!file) return;
     state.rows = normalizeRows(parseCsv(await file.text()));
-    state.usingSample = false;
+    state.dataState = 'live';
+    state.lastUpdated = state.rows.at(-1)?.date || '';
+    setDataStatus('live', `Loaded ${file.name}`);
+    elements.uploadLink.hidden = true;
     render();
   });
 
@@ -114,7 +145,7 @@ function bindMenu(control, menu) {
     closeMenus();
     if (wasHidden) {
       const rect = control.getBoundingClientRect();
-      menu.style.left = `${Math.min(rect.left, window.innerWidth - 230)}px`;
+      menu.style.left = `${Math.min(rect.left, window.innerWidth - 240)}px`;
       menu.style.top = `${rect.bottom + 8}px`;
       menu.hidden = false;
       control.setAttribute('aria-expanded', 'true');
@@ -130,108 +161,140 @@ function closeMenus() {
 }
 
 function render() {
+  elements.cadenceControl.textContent = labels[state.cadence];
+  elements.windowControl.textContent = labels[state.window];
+  elements.revenueSubtitle.textContent = `${labels[state.cadence]} fees and cumulative fees over time`;
+
+  if (!state.rows.length) {
+    renderEmpty();
+    return;
+  }
+
   const filteredRows = filterRows(state.rows, state.window);
   const groupedRows = groupRows(filteredRows, state.cadence);
   const metrics = computeMetrics(filteredRows);
   const groupedMetrics = computeMetrics(groupedRows);
-
-  elements.cadenceControl.textContent = labels[state.cadence];
-  elements.windowControl.textContent = labels[state.window];
-  elements.dataNotice.hidden = !state.usingSample;
-  elements.revenueSubtitle.textContent = `${labels[state.cadence]} fee and cumulative fee over time`;
+  const categories = categoryTotals(filteredRows);
+  const topCategory = categories[0]?.[0];
 
   elements.totalFees.textContent = formatCurrency(metrics.totalFees);
-  elements.totalDelta.textContent = metrics.firstDate ? `From ${formatDateLabel(metrics.firstDate)} to ${formatDateLabel(metrics.lastDate)}` : 'No loaded history';
-  elements.avgLabel.textContent = `${labels[state.cadence]} Average Fees`;
+  elements.totalDelta.textContent = metrics.firstDate
+    ? `${formatDateLabel(metrics.firstDate)} → ${formatDateLabel(metrics.lastDate)}`
+    : 'No loaded history';
+  elements.avgLabel.textContent = `${labels[state.cadence]} average fees`;
   elements.avgFees.textContent = formatCurrency(groupedMetrics.averageDailyFees);
-  elements.avgDelta.textContent = `Average per ${periodLabels[state.cadence]}`;
+  elements.avgDelta.textContent = `Per ${periodLabels[state.cadence]} in window`;
   elements.runRate.textContent = `${formatCurrency(metrics.trailing30Annualized)}/yr`;
-  elements.runRateDelta.textContent = `${formatCurrency(metrics.trailing30Fees)} in latest month`;
+  elements.runRateDelta.textContent = `${formatCurrency(metrics.trailing30Fees)} fees in latest 30 days`;
   elements.highestDay.textContent = formatCurrency(metrics.highestFeeDay?.daily_fee || 0);
-  elements.highestDate.textContent = metrics.highestFeeDay ? formatDateLabel(metrics.highestFeeDay.date) : 'No data';
+  elements.highestDate.textContent = metrics.highestFeeDay
+    ? formatDateLabel(metrics.highestFeeDay.date)
+    : 'No data';
+  elements.categoryTrendLabel.textContent = topCategory
+    ? `${titleCase(topCategory)} fees in the selected window`
+    : 'No category columns in the loaded CSV';
 
   drawRevenueChart(elements.revenueChart, groupedRows, state.cadence);
-  drawCategoryTrendChart(elements.categoryChart, groupedRows, categoryTotals(filteredRows));
+  drawCategoryTrendChart(elements.categoryChart, groupedRows, categories);
   drawRunRateChart(elements.runRateChart, groupRows(filteredRows, 'monthly'));
-  drawCategoryChart(elements.mixChart, categoryTotals(filteredRows));
+  drawCategoryChart(elements.mixChart, categories);
+}
+
+function renderEmpty() {
+  const empty = '—';
+  elements.totalFees.textContent = empty;
+  elements.avgFees.textContent = empty;
+  elements.runRate.textContent = empty;
+  elements.highestDay.textContent = empty;
+  elements.totalDelta.textContent = 'Run scripts/kalshi_fee_calculator.py to generate kalshi_fee_daily.csv';
+  elements.avgDelta.textContent = 'No fee series loaded';
+  elements.runRateDelta.textContent = 'Collector updates hourly on GitHub Actions';
+  elements.highestDate.textContent = 'No data';
+
+  for (const canvas of [
+    elements.revenueChart,
+    elements.categoryChart,
+    elements.runRateChart,
+    elements.mixChart,
+  ]) {
+    drawEmptyPanel(canvas, 'Fee data not loaded yet');
+  }
 }
 
 function drawRevenueChart(canvas, rows, cadence) {
   const chart = setupCanvas(canvas);
   const { ctx, width, height, dpr } = chart;
-  const pad = { top: 18, right: 92, bottom: 70, left: 72 };
+  const pad = { top: 20, right: 88, bottom: 72, left: 78 };
   const plot = bounds(width, height, pad);
   const maxFee = Math.max(...rows.map((row) => row.daily_fee), 1);
   const maxCumulative = Math.max(...rows.map((row) => row.cumulative_fee), 1);
 
   drawGrid(ctx, plot, 5, (value) => formatCurrency(value * maxFee));
-  const barWidth = Math.max(1, plot.width / Math.max(rows.length, 1) * 0.72);
+  const barWidth = Math.max(2, plot.width / Math.max(rows.length, 1) * 0.68);
 
   rows.forEach((row, index) => {
     const x = xAt(plot, index, rows.length);
     const h = (row.daily_fee / maxFee) * plot.height;
-    ctx.fillStyle = 'rgba(32, 216, 149, 0.22)';
+    ctx.fillStyle = palette.accentFill;
     ctx.fillRect(x - barWidth / 2, plot.bottom - h, barWidth, h);
   });
 
   drawLine(ctx, rows.map((row, index) => ({
     x: xAt(plot, index, rows.length),
     y: plot.bottom - (row.cumulative_fee / maxCumulative) * plot.height,
-  })), '#242424', 2.4 * dpr);
+  })), palette.ink, 2.6 * dpr);
 
   drawAxisLabels(ctx, plot, rows, cadence);
   drawRightAxis(ctx, plot, maxCumulative);
-  drawWatermark(ctx, plot);
 }
 
 function drawCategoryTrendChart(canvas, rows, categories) {
   const chart = setupCanvas(canvas);
   const { ctx, width, height, dpr } = chart;
-  const pad = { top: 18, right: 24, bottom: 70, left: 72 };
+  const pad = { top: 20, right: 24, bottom: 72, left: 78 };
   const plot = bounds(width, height, pad);
   const topCategory = categories[0]?.[0];
-  const values = rows.map((row) => topCategory ? (row.categories?.[topCategory] || 0) : row.daily_fee);
+  const values = rows.map((row) => (topCategory ? (row.categories?.[topCategory] || 0) : row.daily_fee));
   const max = Math.max(...values, 1);
   drawGrid(ctx, plot, 5, (value) => formatCurrency(value * max));
   const points = values.map((value, index) => ({
     x: xAt(plot, index, values.length),
     y: plot.bottom - (value / max) * plot.height,
   }));
-  drawArea(ctx, points, plot, 'rgba(32, 216, 149, 0.12)');
-  drawLine(ctx, points, '#20d895', 2 * dpr);
+  drawArea(ctx, points, plot, palette.accentSoft);
+  drawLine(ctx, points, palette.accent, 2.4 * dpr);
   drawAxisLabels(ctx, plot, rows, state.cadence);
-  drawWatermark(ctx, plot);
 }
 
 function drawCategoryChart(canvas, categories) {
   const { ctx, width, height } = setupCanvas(canvas);
-  const pad = { top: 24, right: 18, bottom: 42, left: 130 };
+  const pad = { top: 24, right: 18, bottom: 42, left: 132 };
   const plot = bounds(width, height, pad);
   const data = categories.slice(0, 7);
   const max = Math.max(...data.map(([, value]) => value), 1);
-  const gap = 12;
-  const barHeight = Math.max(18, (plot.height - gap * Math.max(data.length - 1, 0)) / Math.max(data.length, 1));
+  const gap = 14;
+  const barHeight = Math.max(20, (plot.height - gap * Math.max(data.length - 1, 0)) / Math.max(data.length, 1));
 
-  ctx.font = font(15);
+  ctx.font = font(14);
   ctx.textBaseline = 'middle';
   data.forEach(([category, value], index) => {
     const y = plot.top + index * (barHeight + gap);
-    ctx.fillStyle = '#776b5d';
+    ctx.fillStyle = palette.muted;
     ctx.textAlign = 'right';
     ctx.fillText(titleCase(category), plot.left - 14, y + barHeight / 2);
-    ctx.fillStyle = colors[index % colors.length];
+    ctx.fillStyle = palette.bars[index % palette.bars.length];
     ctx.fillRect(plot.left, y, (value / max) * plot.width, barHeight);
-    ctx.fillStyle = '#2c241c';
+    ctx.fillStyle = palette.ink;
     ctx.textAlign = 'left';
-    ctx.fillText(formatCurrency(value), plot.left + (value / max) * plot.width + 8, y + barHeight / 2);
+    ctx.fillText(formatCurrency(value), plot.left + (value / max) * plot.width + 10, y + barHeight / 2);
   });
 
-  if (!data.length) drawEmpty(ctx, width, height);
+  if (!data.length) drawEmptyPanel(canvas, 'No category fee columns found');
 }
 
 function drawRunRateChart(canvas, rows) {
   const { ctx, width, height, dpr } = setupCanvas(canvas);
-  const pad = { top: 18, right: 20, bottom: 58, left: 72 };
+  const pad = { top: 20, right: 20, bottom: 58, left: 78 };
   const plot = bounds(width, height, pad);
   const recent = rows.slice(-18);
   const max = Math.max(...recent.map((row) => row.daily_fee), 1);
@@ -240,10 +303,9 @@ function drawRunRateChart(canvas, rows) {
     x: xAt(plot, index, recent.length),
     y: plot.bottom - (row.daily_fee / max) * plot.height,
   }));
-  drawArea(ctx, points, plot, 'rgba(32, 216, 149, 0.14)');
-  drawLine(ctx, points, '#20d895', 2 * dpr);
+  drawArea(ctx, points, plot, palette.accentSoft);
+  drawLine(ctx, points, palette.accent, 2.4 * dpr);
   drawAxisLabels(ctx, plot, recent, 'monthly');
-  drawWatermark(ctx, plot);
 }
 
 function setupCanvas(canvas) {
@@ -271,10 +333,10 @@ function bounds(width, height, pad) {
 }
 
 function drawGrid(ctx, plot, count, labeler) {
-  ctx.strokeStyle = 'rgba(119, 107, 93, 0.22)';
+  ctx.strokeStyle = palette.grid;
   ctx.lineWidth = 1;
-  ctx.font = font(14);
-  ctx.fillStyle = '#776b5d';
+  ctx.font = font(13);
+  ctx.fillStyle = palette.muted;
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
   for (let index = 0; index <= count; index += 1) {
@@ -289,8 +351,8 @@ function drawGrid(ctx, plot, count, labeler) {
 }
 
 function drawRightAxis(ctx, plot, max) {
-  ctx.font = font(14);
-  ctx.fillStyle = '#776b5d';
+  ctx.font = font(13);
+  ctx.fillStyle = palette.muted;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   for (let index = 0; index <= 4; index += 1) {
@@ -304,6 +366,8 @@ function drawLine(ctx, points, color, width) {
   if (points.length < 2) return;
   ctx.strokeStyle = color;
   ctx.lineWidth = width;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
   ctx.beginPath();
   points.forEach((point, index) => {
     if (index === 0) ctx.moveTo(point.x, point.y);
@@ -325,22 +389,11 @@ function drawArea(ctx, points, plot, color) {
   ctx.fill();
 }
 
-function drawWatermark(ctx, plot) {
-  ctx.save();
-  ctx.globalAlpha = 0.14;
-  ctx.fillStyle = '#2c241c';
-  ctx.font = '700 31px Georgia, "Times New Roman", serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('kalshifees', plot.left + plot.width / 2, plot.top + plot.height / 2);
-  ctx.restore();
-}
-
 function drawAxisLabels(ctx, plot, rows, cadence) {
   if (!rows.length) return;
   const count = Math.min(8, rows.length);
-  ctx.font = font(13);
-  ctx.fillStyle = '#776b5d';
+  ctx.font = font(12);
+  ctx.fillStyle = palette.muted;
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
   for (let index = 0; index < count; index += 1) {
@@ -354,12 +407,13 @@ function drawAxisLabels(ctx, plot, rows, cadence) {
   }
 }
 
-function drawEmpty(ctx, width, height) {
-  ctx.fillStyle = '#776b5d';
-  ctx.font = font(16);
+function drawEmptyPanel(canvas, message) {
+  const { ctx, width, height } = setupCanvas(canvas);
+  ctx.fillStyle = palette.muted;
+  ctx.font = font(15);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('No category columns found', width / 2, height / 2);
+  ctx.fillText(message, width / 2, height / 2);
 }
 
 function xAt(plot, index, length) {
@@ -368,7 +422,7 @@ function xAt(plot, index, length) {
 }
 
 function font(size) {
-  return `${size}px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  return `${size}px ${getComputedStyle(document.body).fontFamily}`;
 }
 
 function titleCase(text) {
@@ -381,38 +435,4 @@ function debounce(fn, wait) {
     clearTimeout(id);
     id = setTimeout(() => fn(...args), wait);
   };
-}
-
-function generateSampleRows() {
-  const rows = [];
-  const start = new Date('2021-06-27T00:00:00Z');
-  const end = new Date('2026-06-28T00:00:00Z');
-  let cumulative = 0;
-  for (let time = start.getTime(), index = 0; time <= end.getTime(); time += 24 * 60 * 60 * 1000, index += 1) {
-    const date = new Date(time).toISOString().slice(0, 10);
-    const growth = Math.pow(index / 1828, 3.8);
-    const seasonality = 0.72 + Math.sin(index / 24) * 0.18 + Math.cos(index / 61) * 0.1;
-    const eraLift = date >= '2025-05-01' ? 2.25 : 1;
-    const sportsSpike = date >= '2024-10-01' && date <= '2025-02-15' ? 2.1 : 1;
-    const daily = Math.max(0, 5500 + 760000 * growth * seasonality * eraLift * sportsSpike);
-    const perps = date >= '2026-05-29' ? daily * 0.1 : 0;
-    const sports = daily * (date >= '2024-10-01' ? 0.42 : 0.18);
-    const economics = daily * 0.34;
-    const politics = daily * (date < '2024-11-10' && date > '2024-06-01' ? 0.32 : 0.08);
-    const weather = daily * 0.09;
-    const crypto = Math.max(0, daily - sports - economics - politics - weather);
-    cumulative += daily + perps;
-    rows.push({
-      date,
-      daily_fee: Math.round((daily + perps) * 100) / 100,
-      cumulative_fee: Math.round(cumulative * 100) / 100,
-      cat_sports: Math.round(sports * 100) / 100,
-      cat_economics: Math.round(economics * 100) / 100,
-      cat_politics: Math.round(politics * 100) / 100,
-      cat_weather: Math.round(weather * 100) / 100,
-      cat_crypto: Math.round(crypto * 100) / 100,
-      cat_perps: Math.round(perps * 100) / 100,
-    });
-  }
-  return rows;
 }
