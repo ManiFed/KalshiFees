@@ -43,7 +43,7 @@ class FeeScheduleTests(unittest.TestCase):
         taker_per = self.c.math.ceil(0.07 * 0.25 * 100) / 100
         self.assertAlmostEqual(fee, taker_per * 10.0)
 
-    def test_candle_uses_mean_dollars_only(self):
+    def test_candle_uses_mean_dollars(self):
         candle = {
             "volume_fp": "5.00",
             "price": {"close_dollars": "0.50", "mean_dollars": "0.48"},
@@ -52,9 +52,22 @@ class FeeScheduleTests(unittest.TestCase):
         expected = self.c.contract_fees(5.0, 0.48, "TEST", self.jan, {})
         self.assertAlmostEqual(fee, expected)
 
-    def test_candle_without_mean_dollars_skips_fee(self):
-        candle = {"volume_fp": "5.00", "price": {"close_dollars": "0.50"}}
+    def test_candle_uses_legacy_mean_field(self):
+        candle = {
+            "volume_fp": "909.00",
+            "price": {"mean": "0.0020", "close": "0.0020"},
+        }
+        fee = self.c.candle_fee(candle, "TEST", self.jan, {})
+        expected = self.c.contract_fees(909.0, 0.0020, "TEST", self.jan, {})
+        self.assertAlmostEqual(fee, expected)
+
+    def test_candle_without_trade_price_skips_fee(self):
+        candle = {"volume_fp": "5.00", "price": {}}
         self.assertEqual(self.c.candle_fee(candle, "TEST", self.jan, {}), 0.0)
+
+    def test_listing_volume_skip(self):
+        self.assertEqual(self.c.listing_volume({"volume_fp": "0.00"}), 0.0)
+        self.assertEqual(self.c.listing_volume({"volume_fp": "12.50"}), 12.5)
 
 
 if __name__ == "__main__":

@@ -65,8 +65,8 @@ Step 6 — Output
 ────────────────────────────────────────────────────────────────────────
 KNOWN APPROXIMATIONS
 ────────────────────────────────────────────────────────────────────────
-  1. Candle mode uses mean_dollars (mean traded price); trade mode uses fill price
-     Direction: small residual error when mean_dollars unavailable (no-trade candles)
+  1. Candle mode uses mean/mean_dollars (mean traded price); trade mode uses fill price
+     Direction: small residual error when no trade price fields exist on a candle
   2. ceil() rounding applied per-candle bucket, not per-fill
      Direction: slight undercount vs per-fill rounding on small trades
   3. Series without fee_changes entries default to taker-only before Oct 2025
@@ -284,19 +284,42 @@ def contract_fees(count: float, price: float, series: str, dt: datetime,
     return total
 
 
-def candle_trade_price(candle: dict) -> float | None:
-    """
-    Use Kalshi's mean_dollars: documented as the mean traded YES price in the
-    candle period (not bid/ask midpoint). Returns None when no trades occurred.
-    """
-    price_block = candle.get("price") or {}
-    raw = price_block.get("mean_dollars")
+def normalize_contract_price(raw) -> float | None:
+    """Parse YES contract price from API (dollars 0–1, or legacy 1–99 cent quotes)."""
     if raw is None:
         return None
     p = float(raw)
-    if p <= 0.0 or p >= 1.0:
+    if p <= 0.0:
+        return None
+    if p > 1.0:
+        if p <= 100.0:
+            p /= 100.0
+        else:
+            return None
+    if p >= 1.0:
         return None
     return p
+
+
+def candle_trade_price(candle: dict) -> float | None:
+    """
+    Mean traded YES price for the candle period.
+    Prefers mean_dollars (current API); falls back to legacy mean/close fields.
+    """
+    price_block = candle.get("price") or {}
+    for field in ("mean_dollars", "mean", "close_dollars", "close"):
+        p = normalize_contract_price(price_block.get(field))
+        if p is not None:
+            return p
+    return None
+
+
+def listing_volume(market: dict) -> float:
+    for field in ("volume_fp", "volume"):
+        val = market.get(field)
+        if val is not None and float(val) > 0:
+            return float(val)
+    return 0.0
 
 
 def trade_fee(trade: dict, series: str, fee_changes: dict) -> float:
@@ -554,6 +577,7 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
     # ── A2: Historical markets ────────────────────────────────────────────────
     print("\n  [A2] Fetching historical markets…")
     hist_count = 0
+    skipped_zero_vol = 0
 
     for m in paginate("/historical/markets", "markets"):
         ticker     = m.get("ticker", "")
@@ -563,6 +587,10 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
 
         # Skip entirely if the whole market closed before our min_date window
         if min_date and close_time and close_time[:10] < min_date:
+            continue
+
+        if listing_volume(m) <= 0:
+            skipped_zero_vol += 1
             continue
 
         candles = fetch_candles_historical(ticker, open_time, close_time)
@@ -590,6 +618,8 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
             print(f"       {hist_count:,} historical | fee ${total_fee:,.0f}", flush=True)
 
     print(f"  [A2] Done. {hist_count:,} historical markets processed.")
+    if skipped_zero_vol:
+        print(f"  Note: {skipped_zero_vol:,} zero-volume markets skipped (no candle fetch).")
     if no_candles:
         print(f"  Note: {no_candles:,} markets had no usable candle data.")
 
@@ -761,7 +791,7 @@ def print_and_save(event: dict, perps: dict, output_dir: str):
     print("  - fee_type from GET /series/fee_changes?show_historical=true")
     print("  - quadratic → taker only; quadratic_with_maker_fees → taker + maker per fill")
     print("  - Per-series multiplier scale from API (0.5× INX/Nasdaq, 0× zero-fee)")
-    print("  - Candle price: mean_dollars (mean traded YES price in period)")
+    print("  - Candle price: mean_dollars / legacy mean (mean traded YES price)")
     print("  - Trade-level alternative: GET /markets/trades (yes_price_dollars per fill)")
     print("  - Intraday markets (<24h): 1-min candles; multi-day: daily candles")
     print("  - ceil() rounding per-market (vs per-fill — slight undercount)")
