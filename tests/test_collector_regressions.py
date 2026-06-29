@@ -6,8 +6,7 @@ from unittest.mock import patch
 
 
 COLLECTOR_PATHS = [
-    Path("/Users/eligoldfine/Downloads/kalshi_fee_calculator (3).py"),
-    Path("/Users/eligoldfine/Documents/kalshifee/scripts/kalshi_fee_calculator.py"),
+    Path(__file__).resolve().parents[1] / "scripts" / "kalshi_fee_calculator.py",
 ]
 
 
@@ -35,6 +34,7 @@ class CollectorRegressionTests(unittest.TestCase):
                                     "category": "economics",
                                     "open_time": "2026-01-01T00:00:00Z",
                                     "close_time": "2026-01-02T00:00:00Z",
+                                    "volume_fp": "10.00",
                                 }
                             ]
                         )
@@ -52,7 +52,7 @@ class CollectorRegressionTests(unittest.TestCase):
                         )
                     return iter(())
 
-                def fake_accumulate(candles, series, category, fee_changes, taker_fraction, daily_series, min_date):
+                def fake_accumulate(candles, series, category, fee_changes, daily_series, min_date):
                     seen_series.append(series)
                     return 1.0, 1.0
 
@@ -63,7 +63,7 @@ class CollectorRegressionTests(unittest.TestCase):
                     patch.object(collector, "accumulate_candles", side_effect=fake_accumulate),
                     patch.object(collector.time, "sleep", return_value=None),
                 ):
-                    collector.process_event_contracts({}, 0.7, None)
+                    collector.process_event_contracts({}, None)
 
                 self.assertEqual(seen_series, ["REAL", "HISTREAL"])
 
@@ -78,7 +78,7 @@ class CollectorRegressionTests(unittest.TestCase):
                 perps = {"total_fee": 0.0, "daily_series": {}}
 
                 with tempfile.TemporaryDirectory() as output_dir:
-                    collector.print_and_save(event, perps, 0.7, output_dir)
+                    collector.print_and_save(event, perps, output_dir)
 
                     self.assertTrue((Path(output_dir) / "kalshi_fee_daily.csv").exists())
                     self.assertTrue((Path(output_dir) / "kalshi_fee_monthly.csv").exists())
@@ -93,7 +93,7 @@ class CollectorRegressionTests(unittest.TestCase):
                     "paginate",
                     return_value=iter([{"ticker": "PERP", "volume_notional_dollars": 1000.0}]),
                 ):
-                    result = collector.process_perps(0.7, None)
+                    result = collector.process_perps(None)
 
                 self.assertGreater(result["total_fee"], 0)
                 self.assertEqual(result["daily_series"], {})

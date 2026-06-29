@@ -17,62 +17,39 @@ Kalshi's fee structure has changed twice in ways that materially affect
 revenue calculations. The script applies different formulas to different
 candle periods based on when the trading actually occurred.
 
-  ERA 1: Launch (Oct 2021) → April 2025
-    Only TAKERS paid fees. Makers paid nothing.
-    Formula: fee = ceil(0.07 × P × (1-P) × contracts, nearest cent)
-    Revenue per trade = taker_fee only
+  ERA 1: Launch → per-series maker-fee rollout (mostly pre-Oct 2025)
+    fee_type = quadratic → takers only.
+    Formula: ceil(0.07 × mult × P × (1-P), ¢) × contracts
 
-  ERA 2: April 2025 → present
-    Both takers AND makers pay fees.
-    Taker: ceil(0.07  × P × (1-P) × contracts, nearest cent)
-    Maker: ceil(0.0175 × P × (1-P) × contracts, nearest cent)
-    Revenue per trade = taker_fee + maker_fee (Kalshi collects both sides)
+  ERA 2: Per-series quadratic_with_maker_fees (sports from Oct 2025, rolling)
+    Both taker AND maker pay on every fill (GWU 2026-001; Kalshi fee schedule).
+    Revenue per trade = taker_fee + maker_fee (no volume-split assumption).
 
-  Per-series multiplier changes:
-    The API exposes GET /exchange/series-fee-changes which returns a
-    timestamped log of every multiplier change per series (e.g. when INX
-    markets got their multiplier halved to 0.035). The script fetches this
-    log at startup and uses it to apply the correct multiplier to each
-    candle period, rather than hardcoding known exceptions.
-    Hardcoded fallbacks (INX/NASDAQ100 halved, zero-fee series) apply only
-    when a series is absent from the fee change log.
+  Per-series schedule:
+    GET /series/fee_changes?show_historical=true → multiplier scale + fee_type
+    GET /series/{ticker} → fallback multiplier (e.g. 0.5 for INX daily, 0 for KXBTCY)
 
 ────────────────────────────────────────────────────────────────────────
 ARCHITECTURE
 ────────────────────────────────────────────────────────────────────────
 
 Step 1 — Load fee change history
-  GET /exchange/series-fee-changes → dict of {series_ticker: [(ts, multiplier)]}
-  Sorted ascending by scheduled_ts so we can binary-search for the correct
-  multiplier at any given candle timestamp.
+  GET /series/fee_changes?show_historical=true → per-series multiplier + fee_type
+  GET /series/{ticker} → fallback multiplier for series absent from the change log
 
 Step 2 — Enumerate all markets
-  Live:       GET /markets (status=open, status=active)
+  Live:       GET /markets (status=open, mve_filter=exclude, activity filter)
   Historical: GET /historical/markets
-  Stored per market: ticker, series_ticker, category, open_time, close_time.
 
 Step 3 — Fetch candlestick data per market
-  Period selection:
-    Markets with lifespan < 24 hours (live in-game sports) → 1-minute candles
-    All others → daily candles
-  Live markets use the batch endpoint (100 tickers/call, split by period).
-  Historical markets are fetched individually (no batch endpoint available).
-  6-hour buffer applied to historical start/end timestamps.
+  Live batch: GET /markets/candlesticks (market_tickers + start_ts + end_ts)
+  Historical: GET /historical/markets/{ticker}/candlesticks
+  Intraday (<24h) → 1-min candles; otherwise daily
 
 Step 4 — Compute fee per candle, accumulate daily time series
-  For each candle:
-    1. Determine which fee era the candle falls in (by end_period_ts)
-    2. Look up the correct taker multiplier for this series at this timestamp
-    3. Apply the era-appropriate formula:
-         Pre-Apr 2025:  fee = ceil(taker_mult × P × (1-P), ¢) × contracts × 1.0
-         Post-Apr 2025: fee = ceil(taker_mult × P × (1-P), ¢) × contracts × taker_fraction
-                            + ceil(maker_mult × P × (1-P), ¢) × contracts × (1-taker_fraction)
-    4. Bucket the fee into daily_series[YYYY-MM-DD] += fee
-
-  This means a market that opened in March 2025 and closed in June 2025 will
-  have its pre-April candles computed with taker-only fees and its post-April
-  candles computed with the combined formula. No market is treated as if it
-  existed entirely in one era.
+  Price: candle mean_dollars (mean traded YES price); fee from contract_fees()
+  fee_type=quadratic → taker only; quadratic_with_maker_fees → taker + maker
+  Per-series schedule applied by candle end_period_ts (not a global calendar cut)
 
 Step 5 — Perpetual futures (separate /margin/ API rail)
   Launched May 29, 2026. Revenue = maker/taker bps on notional volume.
@@ -82,21 +59,18 @@ Step 6 — Output
   • Daily time series table (date, daily_fee, cumulative_fee, category breakdown)
   • Monthly summary table
   • All-time total and trailing-30d annualized run rate
-  • Sensitivity table for maker/taker split assumption
+  • Sensitivity table for fee multiplier uncertainty
   • CSV: kalshi_fee_daily.csv and kalshi_fee_monthly.csv
 
 ────────────────────────────────────────────────────────────────────────
 KNOWN APPROXIMATIONS
 ────────────────────────────────────────────────────────────────────────
-  1. candle.mean is time-weighted midpoint avg, not fill-price VWAP
-     Direction: unknown, magnitude small in liquid markets
-  2. Maker/taker volume split assumed (default 70/30), not measured
-     Direction: undercounts revenue if taker % is higher than assumed
-  3. ceil() rounding applied per-market, not per-fill
+  1. Candle mode uses mean_dollars (mean traded price); trade mode uses fill price
+     Direction: small residual error when mean_dollars unavailable (no-trade candles)
+  2. ceil() rounding applied per-candle bucket, not per-fill
      Direction: slight undercount vs per-fill rounding on small trades
-  4. Fee change log covers per-series multiplier changes but not the
-     global maker-fee introduction date (April 2025), which is hardcoded
-  5. Zero-fee and reduced-fee series list may be incomplete
+  3. Series without fee_changes entries default to taker-only before Oct 2025
+  4. Zero-fee series list may be incomplete if API omits them
      Direction: slight overcount if any zero-fee series are missing
   6. Perp fee bps are defaults; actual authenticated rates are not queried
   7. 6h candle buffer may still miss pre-open activity on some markets
@@ -106,8 +80,8 @@ USAGE
 ────────────────────────────────────────────────────────────────────────
   pip install requests
   python kalshi_fee_calculator.py
-  python kalshi_fee_calculator.py --taker-fraction 0.8
   python kalshi_fee_calculator.py --days 90          # limit to last 90 days
+  python kalshi_fee_calculator.py --skip-live        # historical markets only (bootstrap)
   python kalshi_fee_calculator.py --skip-perps
   python kalshi_fee_calculator.py --output-dir ./outputs
 """
@@ -126,22 +100,17 @@ BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DELAY    = 0.12
 MAX_PAGES = 2000
 
-# ── Fee era boundary ──────────────────────────────────────────────────────────
-# Confirmed by GWU academic paper (2026-001): maker fees introduced after April 2025.
-# We use May 1 as the conservative boundary (gives April markets full taker-only treatment).
-MAKER_FEE_START = datetime(2025, 5, 1, tzinfo=timezone.utc)
-
-# ── Hardcoded fee constants (fallbacks if not in API fee change log) ──────────
+# ── Fee constants (Kalshi fee schedule: 0.07 × C × P × (1-P), maker = 25% of taker) ─
 STANDARD_TAKER = 0.07
 STANDARD_MAKER = 0.0175
-INX_TAKER      = 0.035
-INX_MAKER      = INX_TAKER * 0.25
 
-DEFAULT_TAKER_FRACTION = 0.70
+# Sports maker-fee rollout began Oct–Nov 2025 per GET /series/fee_changes; use API timeline.
+PRE_MAKER_FEES_CUTOFF = datetime(2025, 10, 1, tzinfo=timezone.utc)
 
-# Zero-fee series: confirmed on Kalshi fee schedule page, June 2026
+# Zero-fee series (fee_multiplier=0 in GET /series/{ticker}); kept as fallback.
 ZERO_FEE_SERIES = frozenset({"KXBTCY", "KXCITRINI", "KXDOED"})
-INX_PREFIXES    = ("INX", "NASDAQ100")
+
+_series_fee_cache: dict[str, tuple[float, str]] = {}
 
 INTRADAY_HOURS = 24
 
@@ -168,7 +137,7 @@ def get(path: str, params: dict = None, retries: int = 3) -> dict:
             return r.json()
         except requests.RequestException as e:
             if attempt == retries - 1:
-                print(f"    [error] {url}: {e}", flush=True)
+                print(f"    [error] {path}: {e}", flush=True)
                 return {}
             time.sleep(2 ** attempt)
     return {}
@@ -218,34 +187,31 @@ def date_to_month(d: str) -> str:
     return d[:7]
 
 
-# ── Fee change log ────────────────────────────────────────────────────────────
+# ── Fee schedule (GET /series/fee_changes + GET /series/{ticker}) ─────────────
 
-def load_fee_changes() -> dict[str, list[tuple[datetime, float]]]:
+def load_fee_changes() -> dict[str, list[tuple[datetime, float, str]]]:
     """
-    Fetch GET /exchange/series-fee-changes and build a lookup:
-      {series_ticker: [(effective_datetime, taker_multiplier), ...]}
-    sorted ascending by datetime so we can find the active multiplier
-    at any given candle timestamp.
+    Fetch GET /series/fee_changes?show_historical=true.
 
-    fee_multiplier in the API response is an integer representing the
-    multiplier × 10000 (i.e. 700 = 0.07, 350 = 0.035). We convert here.
+    Returns {series_ticker: [(effective_dt, fee_multiplier_scale, fee_type), ...]}
+    sorted ascending. fee_multiplier is a scale on the standard 0.07 / 0.0175 rates
+    (e.g. 0.5 → half fees for INX/Nasdaq daily markets; 0 → zero-fee).
     """
-    data = get("/exchange/series-fee-changes")
+    data = get("/series/fee_changes", {"show_historical": True})
     changes_raw = data.get("series_fee_change_arr", [])
 
-    result: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    result: dict[str, list[tuple[datetime, float, str]]] = defaultdict(list)
     for c in changes_raw:
-        series  = c.get("series_ticker", "")
+        series   = c.get("series_ticker", "")
         mult_raw = c.get("fee_multiplier")
-        ts_str  = c.get("scheduled_ts", "")
+        ftype    = c.get("fee_type", "quadratic")
+        ts_str   = c.get("scheduled_ts", "")
         if not series or mult_raw is None or not ts_str:
             continue
-        dt   = parse_iso(ts_str)
-        mult = float(mult_raw) / 10000.0  # convert integer basis to decimal
+        dt = parse_iso(ts_str)
         if dt:
-            result[series].append((dt, mult))
+            result[series].append((dt, float(mult_raw), ftype))
 
-    # Sort each series list ascending by effective date
     for series in result:
         result[series].sort(key=lambda x: x[0])
 
@@ -254,81 +220,105 @@ def load_fee_changes() -> dict[str, list[tuple[datetime, float]]]:
     return dict(result)
 
 
-def taker_mult_at(series: str, candle_dt: datetime,
-                  fee_changes: dict) -> float | None:
-    """
-    Return the taker fee multiplier for a given series at a given datetime.
-    Returns None for zero-fee series.
+def get_series_fee_default(series: str) -> tuple[float, str]:
+    if series in _series_fee_cache:
+        return _series_fee_cache[series]
+    data = get(f"/series/{series}")
+    meta = data.get("series", data) if isinstance(data, dict) else {}
+    mult = float(meta.get("fee_multiplier", 1))
+    ftype = meta.get("fee_type", "quadratic")
+    _series_fee_cache[series] = (mult, ftype)
+    return mult, ftype
 
-    Priority:
-      1. Zero-fee series list → None
-      2. API fee change log → use the most recent change before candle_dt
-      3. Hardcoded INX/NASDAQ100 fallback → INX_TAKER
-      4. Default → STANDARD_TAKER
+
+def fee_state_at(series: str, dt: datetime,
+                 fee_changes: dict) -> tuple[float, str]:
+    """
+    Return (fee_multiplier_scale, fee_type) for a series at datetime dt.
+
+    fee_type values from Kalshi API:
+      quadratic                  → taker fees only
+      quadratic_with_maker_fees  → taker + maker fees (both sides pay per fill)
+      margin_market_maker_program_fees → perp MM program (treated as zero here)
     """
     if series in ZERO_FEE_SERIES:
+        return 0.0, "quadratic"
+
+    changes = fee_changes.get(series, [])
+    if changes:
+        dates = [row[0] for row in changes]
+        idx = bisect_right(dates, dt) - 1
+        if idx >= 0:
+            return changes[idx][1], changes[idx][2]
+        return changes[0][1], "quadratic"
+
+    mult, ftype = get_series_fee_default(series)
+    if dt < PRE_MAKER_FEES_CUTOFF:
+        return mult, "quadratic"
+    return mult, ftype
+
+
+def contract_fees(count: float, price: float, series: str, dt: datetime,
+                  fee_changes: dict) -> float:
+    """
+    Kalshi exchange revenue for count contracts at price P.
+
+    Each matched trade collects taker fee from the taker AND maker fee from the
+    maker when fee_type is quadratic_with_maker_fees — no volume-split assumption.
+    """
+    if count <= 0 or price <= 0.0 or price >= 1.0:
+        return 0.0
+
+    mult, ftype = fee_state_at(series, dt, fee_changes)
+    if mult == 0 or ftype == "margin_market_maker_program_fees":
+        return 0.0
+
+    variance = price * (1.0 - price)
+    taker_per = math.ceil(STANDARD_TAKER * mult * variance * 100) / 100
+    total = taker_per * count
+
+    if ftype == "quadratic_with_maker_fees":
+        maker_per = math.ceil(STANDARD_MAKER * mult * variance * 100) / 100
+        total += maker_per * count
+
+    return total
+
+
+def candle_trade_price(candle: dict) -> float | None:
+    """
+    Use Kalshi's mean_dollars: documented as the mean traded YES price in the
+    candle period (not bid/ask midpoint). Returns None when no trades occurred.
+    """
+    price_block = candle.get("price") or {}
+    raw = price_block.get("mean_dollars")
+    if raw is None:
         return None
+    p = float(raw)
+    if p <= 0.0 or p >= 1.0:
+        return None
+    return p
 
-    if series in fee_changes:
-        changes = fee_changes[series]
-        effective_dates = [dt for dt, _ in changes]
-        index = bisect_right(effective_dates, candle_dt) - 1
-        if index >= 0:
-            return changes[index][1]
 
-    # Hardcoded fallbacks
-    for prefix in INX_PREFIXES:
-        if series.startswith(prefix):
-            return INX_TAKER
-
-    return STANDARD_TAKER
+def trade_fee(trade: dict, series: str, fee_changes: dict) -> float:
+    """Exact fill-price fee from GET /markets/trades (yes_price_dollars + count_fp)."""
+    count = float(trade.get("count_fp") or trade.get("count") or 0)
+    price = float(trade.get("yes_price_dollars") or 0)
+    created = parse_iso(trade.get("created_time", ""))
+    if not created or count <= 0:
+        return 0.0
+    return contract_fees(count, price, series, created, fee_changes)
 
 
 def candle_fee(candle: dict, series: str, candle_dt: datetime,
-               fee_changes: dict, taker_fraction: float) -> float:
-    """
-    Compute Kalshi's total fee revenue from a single candlestick.
-
-    Applies era-correct formula:
-      Before MAKER_FEE_START: taker fee only (makers paid nothing)
-      After  MAKER_FEE_START: taker fee + maker fee (Kalshi collects both)
-
-    Uses explicit None check for price field to avoid falsy-zero fallthrough.
-    """
+               fee_changes: dict) -> float:
+    """Fee estimate for one candlestick bucket using mean traded price."""
     vol = float(candle.get("volume_fp") or candle.get("volume") or 0)
     if vol == 0:
         return 0.0
-
-    price_block = candle.get("price") or {}
-    p_raw = None
-    for field in ("mean_dollars", "mean", "close_dollars", "close"):
-        candidate = price_block.get(field)
-        if candidate is not None:
-            p_raw = candidate
-            break
-    if p_raw is None:
+    price = candle_trade_price(candle)
+    if price is None:
         return 0.0
-
-    p = float(p_raw)
-    if p <= 0.0 or p >= 1.0:
-        return 0.0
-
-    tm = taker_mult_at(series, candle_dt, fee_changes)
-    if tm is None:
-        return 0.0  # zero-fee series
-
-    variance = p * (1.0 - p)
-    taker_fee_per = math.ceil(tm * variance * 100) / 100
-
-    if candle_dt < MAKER_FEE_START:
-        # ERA 1: taker-only
-        return taker_fee_per * vol
-    else:
-        # ERA 2: taker + maker, split by assumed fraction
-        mm = tm * 0.25  # maker is always 25% of taker per fee schedule
-        maker_fee_per = math.ceil(mm * variance * 100) / 100
-        return (taker_fee_per * vol * taker_fraction +
-                maker_fee_per * vol * (1.0 - taker_fraction))
+    return contract_fees(vol, price, series, candle_dt, fee_changes)
 
 
 # ── Candle period / intraday detection ───────────────────────────────────────
@@ -343,6 +333,23 @@ def is_intraday(open_time: str, close_time: str) -> bool:
 def candle_period(open_time: str, close_time: str) -> int:
     return 1 if is_intraday(open_time, close_time) else 1440
 
+def candle_time_params(open_time: str = "", close_time: str = "") -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+    o = parse_iso(open_time)
+    c = parse_iso(close_time)
+    start = int((o - timedelta(hours=6)).timestamp()) if o else int((now - timedelta(days=90)).timestamp())
+    end   = int((c + timedelta(hours=6)).timestamp()) if c else int(now.timestamp())
+    if end <= start:
+        end = start + 3600
+    return {"start_ts": start, "end_ts": end}
+
+def market_has_activity(market: dict) -> bool:
+    for field in ("volume_fp", "volume_24h_fp", "open_interest_fp", "volume", "volume_24h"):
+        val = market.get(field)
+        if val is not None and float(val) > 0:
+            return True
+    return False
+
 
 # ── Candlestick fetchers ──────────────────────────────────────────────────────
 
@@ -350,18 +357,14 @@ def fetch_candles_live(series_ticker: str, market_ticker: str,
                        open_time: str = "", close_time: str = "") -> list:
     period = candle_period(open_time, close_time)
     path   = f"/series/{series_ticker}/markets/{market_ticker}/candlesticks"
-    return get(path, {"period_interval": period}).get("candlesticks", [])
+    params = {"period_interval": period, **candle_time_params(open_time, close_time)}
+    return get(path, params).get("candlesticks", [])
 
 def fetch_candles_historical(market_ticker: str,
                               open_time: str = "", close_time: str = "") -> list:
     period = candle_period(open_time, close_time)
     path   = f"/historical/markets/{market_ticker}/candlesticks"
-    params: dict = {"period_interval": period}
-    o = parse_iso(open_time)
-    c = parse_iso(close_time)
-    if o and c:
-        params["start_ts"] = int((o - timedelta(hours=6)).timestamp())
-        params["end_ts"]   = int((c + timedelta(hours=6)).timestamp())
+    params = {"period_interval": period, **candle_time_params(open_time, close_time)}
     return get(path, params).get("candlesticks", [])
 
 def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
@@ -377,8 +380,21 @@ def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
     def _batch(tickers: list[str], period: int):
         for i in range(0, len(tickers), 100):
             chunk = tickers[i:i+100]
-            data  = get("/markets/candlesticks",
-                        {"tickers": ",".join(chunk), "period_interval": period})
+            starts, ends = [], []
+            for ticker in chunk:
+                meta = ticker_meta.get(ticker, {})
+                bounds = candle_time_params(meta.get("open_time", ""), meta.get("close_time", ""))
+                starts.append(bounds["start_ts"])
+                ends.append(bounds["end_ts"])
+            data = get(
+                "/markets/candlesticks",
+                {
+                    "market_tickers": ",".join(chunk),
+                    "period_interval": period,
+                    "start_ts": min(starts),
+                    "end_ts": max(ends),
+                },
+            )
             for entry in data.get("markets", []):
                 tk = entry.get("market_ticker", "")
                 cs = entry.get("candlesticks", [])
@@ -428,12 +444,12 @@ def categorize(ticker: str, api_category: str = "") -> str:
 # ── Core accumulator ──────────────────────────────────────────────────────────
 
 def accumulate_candles(candles: list, series: str, category: str,
-                       fee_changes: dict, taker_fraction: float,
-                       daily_series: dict, min_date: str | None):
+                       fee_changes: dict, daily_series: dict,
+                       min_date: str | None):
     """
     Process all candles for one market. For each candle:
       - Determine the calendar date from end_period_ts
-      - Apply era-correct fee formula (taker-only before May 2025)
+      - Apply per-series fee_type + multiplier from fee change log
       - Accumulate into daily_series[date][category]
 
     min_date: if provided, skip candles before this date (for --days filtering)
@@ -454,7 +470,7 @@ def accumulate_candles(candles: list, series: str, category: str,
         candle_dt = datetime.fromtimestamp(int(end_ts), tz=timezone.utc)
         vol = float(c.get("volume_fp") or c.get("volume") or 0)
 
-        fee = candle_fee(c, series, candle_dt, fee_changes, taker_fraction)
+        fee = candle_fee(c, series, candle_dt, fee_changes)
 
         if vol > 0:
             total_contracts += vol
@@ -466,8 +482,8 @@ def accumulate_candles(candles: list, series: str, category: str,
 
 # ── Part A: Event Contracts ───────────────────────────────────────────────────
 
-def process_event_contracts(fee_changes: dict, taker_fraction: float,
-                             min_date: str | None) -> dict:
+def process_event_contracts(fee_changes: dict, min_date: str | None,
+                             skip_live: bool = False) -> dict:
     print("\n══ PART A: EVENT CONTRACTS ══════════════════════════════════")
 
     # daily_series[date][category] = fee
@@ -479,56 +495,61 @@ def process_event_contracts(fee_changes: dict, taker_fraction: float,
     no_candles      = 0
 
     # ── A1: Live markets ──────────────────────────────────────────────────────
-    print("\n  [A1] Fetching live markets…")
-    live_markets = {}
-    for status in ("open", "active"):
-        for m in paginate("/markets", "markets", {"status": status}):
+    if skip_live:
+        print("\n  [A1] Skipping live markets (--skip-live).")
+    else:
+        print("\n  [A1] Fetching live markets with activity…")
+        live_markets = {}
+        scanned = 0
+        for m in paginate("/markets", "markets", {"status": "open", "mve_filter": "exclude"}):
+            scanned += 1
             ticker = m.get("ticker")
-            if ticker:
+            if ticker and market_has_activity(m):
                 live_markets[ticker] = m
-    print(f"       {len(live_markets):,} live markets found")
+        print(f"       {len(live_markets):,} active open markets (scanned {scanned:,})")
 
-    live_meta = {}
-    for m in live_markets.values():
-        live_meta[m["ticker"]] = {
-            "series_ticker": m.get("series_ticker", ""),
-            "category":      m.get("category", ""),
-            "open_time":     m.get("open_time", ""),
-            "close_time":    m.get("close_time", ""),
-        }
+        live_meta = {}
+        for m in live_markets.values():
+            live_meta[m["ticker"]] = {
+                "series_ticker": m.get("series_ticker", ""),
+                "category":      m.get("category", ""),
+                "open_time":     m.get("open_time", ""),
+                "close_time":    m.get("close_time", ""),
+            }
 
-    print("  [A1] Batch-fetching candlesticks…")
-    candle_map = batch_fetch_candles_live(live_meta)
+        print("  [A1] Batch-fetching candlesticks…")
+        candle_map = batch_fetch_candles_live(live_meta)
 
-    for ticker, meta in live_meta.items():
-        candles = candle_map.get(ticker, [])
-        if not candles and meta["series_ticker"]:
-            candles = fetch_candles_live(meta["series_ticker"], ticker,
-                                         meta["open_time"], meta["close_time"])
-            time.sleep(DELAY)
+        live_processed = 0
+        for ticker, meta in live_meta.items():
+            candles = candle_map.get(ticker, [])
+            if not candles and meta["series_ticker"]:
+                candles = fetch_candles_live(meta["series_ticker"], ticker,
+                                             meta["open_time"], meta["close_time"])
+                time.sleep(DELAY)
 
-        if not candles:
-            no_candles += 1
-            continue
+            if not candles:
+                no_candles += 1
+                continue
 
-        series   = (meta.get("series_ticker") or ticker.split("-")[0]).upper()
-        category = categorize(ticker, meta["category"])
-        contracts, fee = accumulate_candles(
-            candles, series, category, fee_changes, taker_fraction,
-            daily_series, min_date
-        )
-        if contracts == 0:
-            no_candles += 1
-            continue
+            series   = (meta.get("series_ticker") or ticker.split("-")[0]).upper()
+            category = categorize(ticker, meta["category"])
+            contracts, fee = accumulate_candles(
+                candles, series, category, fee_changes, daily_series, min_date
+            )
+            if contracts == 0:
+                no_candles += 1
+                continue
 
-        total_markets   += 1
-        total_contracts += contracts
-        total_fee       += fee
+            total_markets   += 1
+            live_processed  += 1
+            total_contracts += contracts
+            total_fee       += fee
 
-        if total_markets % 500 == 0:
-            print(f"       {total_markets:,} markets | fee ${total_fee:,.0f}", flush=True)
+            if live_processed % 500 == 0:
+                print(f"       {live_processed:,} live markets | fee ${total_fee:,.0f}", flush=True)
 
-    print(f"  [A1] Done. {total_markets:,} live markets processed.")
+        print(f"  [A1] Done. {live_processed:,} live markets processed.")
 
     # ── A2: Historical markets ────────────────────────────────────────────────
     print("\n  [A2] Fetching historical markets…")
@@ -554,8 +575,7 @@ def process_event_contracts(fee_changes: dict, taker_fraction: float,
         series   = (m.get("series_ticker") or ticker.split("-")[0]).upper()
         category = categorize(ticker, api_cat)
         contracts, fee = accumulate_candles(
-            candles, series, category, fee_changes, taker_fraction,
-            daily_series, min_date
+            candles, series, category, fee_changes, daily_series, min_date
         )
         if contracts == 0:
             no_candles += 1
@@ -583,7 +603,7 @@ def process_event_contracts(fee_changes: dict, taker_fraction: float,
 
 # ── Part B: Perpetual Futures ─────────────────────────────────────────────────
 
-def process_perps(taker_fraction: float, min_date: str | None) -> dict:
+def process_perps(min_date: str | None) -> dict:
     print("\n══ PART B: PERPETUAL FUTURES ════════════════════════════════")
     print("   Launched May 29, 2026 — only ~1 month of history available")
 
@@ -613,16 +633,13 @@ def process_perps(taker_fraction: float, min_date: str | None) -> dict:
             price     = float(m.get("mark_price") or m.get("last_price") or 0)
             notional  = contracts * price
 
-        blended = (PERP_TAKER_BPS * taker_fraction +
-                   PERP_MAKER_BPS * (1 - taker_fraction))
-        fee = notional * blended
+        fee = notional * (PERP_TAKER_BPS + PERP_MAKER_BPS)
 
         total_notional += notional
         total_fee      += fee
 
-    note = (f"defaults: {PERP_MAKER_BPS*1e4:.1f} bps maker / "
-            f"{PERP_TAKER_BPS*1e4:.1f} bps taker / "
-            f"{taker_fraction*100:.0f}% taker assumed")
+    note = (f"defaults: {PERP_MAKER_BPS*1e4:.1f} bps maker + "
+            f"{PERP_TAKER_BPS*1e4:.1f} bps taker on notional")
     print(f"   Total notional: ${total_notional:,.0f} | Fee: ${total_fee:,.0f}")
     print(f"   ({note})")
 
@@ -632,7 +649,7 @@ def process_perps(taker_fraction: float, min_date: str | None) -> dict:
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
-def print_and_save(event: dict, perps: dict, taker_fraction: float, output_dir: str):
+def print_and_save(event: dict, perps: dict, output_dir: str):
     ef = event["total_fee"]
     pf = perps.get("total_fee", 0.0)
     gt = ef + pf
@@ -721,35 +738,32 @@ def print_and_save(event: dict, perps: dict, taker_fraction: float, output_dir: 
         print(f"  Trailing 30d annualized:  ${annual30/1e6:>12.1f}M/year  ← current run rate")
     print()
 
-    # Fee era split
-    era1_dates = [r for r in daily_rows if r["date"] < "2025-05-01"]
-    era2_dates = [r for r in daily_rows if r["date"] >= "2025-05-01"]
+    # Fee era split (approximate calendar cut — actual maker fees are per-series)
+    era1_dates = [r for r in daily_rows if r["date"] < "2025-10-01"]
+    era2_dates = [r for r in daily_rows if r["date"] >= "2025-10-01"]
     era1_total = sum(r["daily_fee"] for r in era1_dates)
     era2_total = sum(r["daily_fee"] for r in era2_dates)
     if era1_total > 0 or era2_total > 0:
-        print(f"  Era 1 (taker-only, pre-May 2025): ${era1_total/1e6:.2f}M")
-        print(f"  Era 2 (taker+maker, May 2025+):   ${era2_total/1e6:.2f}M")
+        print(f"  Pre-Oct 2025 fees (mostly taker-only):  ${era1_total/1e6:.2f}M")
+        print(f"  Oct 2025+ fees (incl. maker rollouts):  ${era2_total/1e6:.2f}M")
         print()
 
     # ── Sensitivity ──────────────────────────────────────────────────────────
-    base_tf   = taker_fraction
-    base_rate = STANDARD_TAKER * base_tf + STANDARD_MAKER * (1 - base_tf)
-    print("  Maker/taker sensitivity (approximate; standard current fee rates only):")
-    for tf in (0.60, 0.70, 0.80):
-        rate  = STANDARD_TAKER * tf + STANDARD_MAKER * (1 - tf)
-        scaled = gt * (rate / base_rate) if base_rate > 0 else gt
-        marker = " ← base" if abs(tf - base_tf) < 0.01 else ""
-        print(f"    {tf*100:.0f}/{(1-tf)*100:.0f}: ${scaled/1e6:.1f}M{marker}")
+    print("  Fee multiplier sensitivity (standard 0.07/0.0175 quadratic rates):")
+    for mult in (0.5, 1.0, 1.25):
+        scaled = gt * mult
+        marker = " ← base" if abs(mult - 1.0) < 0.01 else ""
+        print(f"    mult {mult:.2f}×: ${scaled/1e6:.1f}M{marker}")
     print()
 
     # ── Methodology ──────────────────────────────────────────────────────────
     print("  METHODOLOGY & APPROXIMATIONS:")
-    print(f"  - Era 1 (pre-May 2025): taker-only formula (0.07 × P × (1-P))")
-    print(f"  - Era 2 (May 2025+): taker + maker, split {taker_fraction*100:.0f}%/{(1-taker_fraction)*100:.0f}%")
-    print("  - Fee era boundary applied per candle, not per market")
-    print("  - Per-series multipliers from GET /exchange/series-fee-changes")
+    print("  - fee_type from GET /series/fee_changes?show_historical=true")
+    print("  - quadratic → taker only; quadratic_with_maker_fees → taker + maker per fill")
+    print("  - Per-series multiplier scale from API (0.5× INX/Nasdaq, 0× zero-fee)")
+    print("  - Candle price: mean_dollars (mean traded YES price in period)")
+    print("  - Trade-level alternative: GET /markets/trades (yes_price_dollars per fill)")
     print("  - Intraday markets (<24h): 1-min candles; multi-day: daily candles")
-    print("  - VWAP approx: time-weighted midpoint mean, not fill-price VWAP")
     print("  - ceil() rounding per-market (vs per-fill — slight undercount)")
     print("  - Zero-fee series excluded: KXBTCY, KXCITRINI, KXDOED")
     print("  - Perp fees: bps defaults used; authenticated actual rates are not queried")
@@ -789,11 +803,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Kalshi fee revenue estimator — daily time series with era-correct fee formulas"
     )
-    parser.add_argument("--taker-fraction", type=float, default=DEFAULT_TAKER_FRACTION,
-                        help=f"Fraction of volume that is taker-initiated (default: {DEFAULT_TAKER_FRACTION})")
     parser.add_argument("--days", type=int, default=None,
                         help="Only include data from the last N days (default: all time)")
     parser.add_argument("--skip-perps",       action="store_true")
+    parser.add_argument("--skip-live",        action="store_true",
+                        help="Skip open-market scan; use historical markets only")
     parser.add_argument("--output-dir", default=".",
                         help="Directory for kalshi_fee_daily.csv and kalshi_fee_monthly.csv (default: current directory)")
     args = parser.parse_args()
@@ -804,23 +818,25 @@ def main():
 
     print("Kalshi Fee Revenue Estimator v4")
     print(f"Base URL:       {BASE_URL}")
-    print(f"Taker fraction: {args.taker_fraction*100:.0f}%")
     print(f"Window:         {'all time' if not min_date else f'from {min_date}'}")
-    print(f"Fee era:        taker-only before May 2025 / taker+maker after")
+    print(f"Fee schedule:   GET /series/fee_changes + per-fill taker+maker when applicable")
+    print(f"Fee era:        per-series fee_type from API (sports maker fees from Oct 2025)")
     print()
 
     print("  [0] Loading fee change history…")
     fee_changes = load_fee_changes()
 
-    event_results = process_event_contracts(fee_changes, args.taker_fraction, min_date)
+    event_results = process_event_contracts(
+        fee_changes, min_date, skip_live=args.skip_live
+    )
 
     perp_results = {"total_fee": 0.0, "total_notional": 0.0,
                     "daily_series": {}, "note": "skipped",
                     "all_time_adjustment": False}
     if not args.skip_perps:
-        perp_results = process_perps(args.taker_fraction, min_date)
+        perp_results = process_perps(min_date)
 
-    print_and_save(event_results, perp_results, args.taker_fraction, args.output_dir)
+    print_and_save(event_results, perp_results, args.output_dir)
 
 
 if __name__ == "__main__":
