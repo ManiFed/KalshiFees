@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      refresh_days:
+        description: Days of history to refresh from Kalshi
+        required: false
+        default: '45'
+      full_history:
+        description: Attempt a full-history rebuild (slow, may timeout)
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -15,7 +24,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,7 +40,26 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Collect Kalshi fee data
-        run: python3 scripts/kalshi_fee_calculator.py --output-dir .
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          REFRESH_DAYS="${{ github.event.inputs.refresh_days }}"
+          if [ -z "$REFRESH_DAYS" ]; then
+            REFRESH_DAYS="45"
+          fi
+          ARGS=(--output-dir /tmp/fee-refresh --skip-perps)
+          if [ "${{ github.event.inputs.full_history }}" = "true" ]; then
+            echo "Running full-history collector"
+          else
+            echo "Running incremental refresh for last ${REFRESH_DAYS} days"
+            ARGS+=(--days "$REFRESH_DAYS")
+          fi
+          python3 scripts/kalshi_fee_calculator.py "${ARGS[@]}"
+          python3 scripts/merge_fee_csv.py \
+            --existing kalshi_fee_daily.csv \
+            --incoming /tmp/fee-refresh/kalshi_fee_daily.csv \
+            --output-dir .
 
       - name: Commit and push updated CSVs
         run: |
