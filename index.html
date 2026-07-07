@@ -120,15 +120,15 @@
 
           <section class="method-block">
             <h3>Two fee eras</h3>
-            <p>Kalshi's fee schedule changed materially in 2025. The script assigns each candle to an era by its end timestamp, so a market that spans the boundary gets pre-May and post-May fees applied separately.</p>
+            <p>Kalshi's fee schedule changed materially through 2025. The script looks up each series' fee type as of the candle's own end timestamp, so a market spanning the boundary gets pre-rollout and post-rollout fees applied separately, and different series can flip on different dates.</p>
             <div class="era-grid">
               <article>
-                <h4>Era 1 — Taker-only (launch → April 2025)</h4>
-                <p>Only takers paid. Per contract: <code>ceil(0.07 × P × (1−P))</code> dollars, where <code>P</code> is the contract price.</p>
+                <h4>Era 1 — <code>quadratic</code> (taker-only)</h4>
+                <p>Only the taker pays. Per contract: <code>ceil(0.07 × mult × P × (1−P), ¢)</code> dollars, where <code>P</code> is the mean traded price and <code>mult</code> is the series' fee multiplier.</p>
               </article>
               <article>
-                <h4>Era 2 — Taker + maker (May 2025 → present)</h4>
-                <p>Both sides pay. Taker: <code>ceil(taker_mult × P × (1−P))</code>. Maker: <code>ceil(maker_mult × P × (1−P))</code> with <code>maker_mult = 0.25 × taker_mult</code>. Volume is split 70% taker / 30% maker by default (<code>--taker-fraction</code>).</p>
+                <h4>Era 2 — <code>quadratic_with_maker_fees</code></h4>
+                <p>Both sides pay in full on every fill — there is no volume-split assumption. Taker: <code>ceil(0.07 × mult × P × (1−P), ¢)</code>. Maker: <code>ceil(0.0175 × mult × P × (1−P), ¢)</code> (maker rate is a fixed 25% of the taker rate). Sports series began rolling onto this fee type from roughly October 2025 onward, per series.</p>
               </article>
             </div>
           </section>
@@ -136,11 +136,11 @@
           <section class="method-block">
             <h3>Collector pipeline</h3>
             <ol class="pipeline">
-              <li><strong>Fee multipliers</strong> — Fetch <code>/exchange/series-fee-changes</code> and binary-search the correct taker multiplier for each series at each candle time. Fallbacks cover INX/NASDAQ100 halved rates and zero-fee series (<code>KXBTCY</code>, <code>KXCITRINI</code>, <code>KXDOED</code>).</li>
-              <li><strong>Market universe</strong> — Enumerate open, active, and historical markets via <code>/markets</code> and <code>/historical/markets</code>.</li>
-              <li><strong>Candlesticks</strong> — Markets under 24 hours use 1-minute candles; longer markets use daily candles. Historical pulls include a 6-hour buffer around open/close.</li>
-              <li><strong>Per-candle fees</strong> — Multiply rounded per-contract fees by candle volume, bucket into UTC dates, and accumulate category columns (<code>cat_*</code>).</li>
-              <li><strong>Perpetuals</strong> — Separate <code>/margin/</code> rail; default 5 bps taker / 2 bps maker on notional. No daily perp history means perp totals may appear as an all-time adjustment outside the daily series.</li>
+              <li><strong>Fee multipliers</strong> — Fetch <code>GET /series/fee_changes?show_historical=true</code> for each series' multiplier and fee type over time, with <code>GET /series/{ticker}</code> as a fallback for series absent from that log. Zero-fee series (<code>KXBTCY</code>, <code>KXCITRINI</code>, <code>KXDOED</code>) are hardcoded to a zero multiplier.</li>
+              <li><strong>Market universe</strong> — Enumerate open markets via <code>/markets</code> and closed markets via <code>/historical/markets</code>, deduped by ticker.</li>
+              <li><strong>Candlesticks</strong> — Markets open under 24 hours use 1-minute candles; longer-lived markets use daily candles. Both live and historical candle requests include a 6-hour buffer around open/close.</li>
+              <li><strong>Per-candle fees</strong> — Apply the fee formula to each candle's mean traded price and volume using the fee schedule in effect at that candle's timestamp, then bucket into UTC dates and accumulate category columns (<code>cat_*</code>).</li>
+              <li><strong>Perpetuals</strong> — Separate <code>/margin/markets</code> rail; default 5 bps taker / 2 bps maker on notional volume. Funding-rate flows are excluded since they move between traders, not to Kalshi. No daily perp history is available yet, so perp fees are reported as an all-time total rather than folded into the daily series.</li>
               <li><strong>Output</strong> — Write <code>kalshi_fee_daily.csv</code> and <code>kalshi_fee_monthly.csv</code>; this page loads the daily file.</li>
             </ol>
           </section>
@@ -154,8 +154,8 @@
             <h3>Known limitations</h3>
             <ul>
               <li>Candle mean price is a midpoint proxy, not fill-price VWAP.</li>
-              <li>Fee rounding uses market-candle granularity, not per-fill — small trades may be slightly undercounted.</li>
-              <li>Maker/taker split is assumed (70/30), not observed from the API.</li>
+              <li>Fee rounding uses per-candle granularity, not per-fill — small trades may be slightly undercounted.</li>
+              <li>Series with no entry in the fee-change log default to taker-only before the maker-fee rollout cutoff.</li>
               <li>Zero-fee or reduced-fee series missing from the API log can bias totals.</li>
               <li>Rate limits, pagination ceilings, or API gaps can truncate market coverage.</li>
             </ul>
