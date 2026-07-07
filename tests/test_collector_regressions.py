@@ -127,6 +127,56 @@ class CollectorRegressionTests(unittest.TestCase):
                     self.assertEqual(loaded["historical_cursor"], "cursor-abc")
                     self.assertEqual(loaded["daily_series"]["2026-01-01"]["sports"], 12.5)
 
+    def test_candle_time_params_caps_far_future_close_to_now(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                fixed_now = collector.datetime(2026, 7, 7, 12, 0, 0, tzinfo=collector.timezone.utc)
+                with patch.object(collector, "datetime") as mock_dt:
+                    mock_dt.now.return_value = fixed_now
+                    mock_dt.side_effect = lambda *args, **kwargs: collector.datetime(*args, **kwargs)
+                    bounds = collector.candle_time_params(
+                        "2026-01-01T00:00:00Z",
+                        "2035-12-31T23:59:59Z",
+                        cap_end_to_now=True,
+                    )
+                self.assertLessEqual(bounds["end_ts"], int(fixed_now.timestamp()) + 3600)
+
+    def test_batch_fetch_bisects_on_400(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                ticker_meta = {
+                    f"TICK-{i}": {
+                        "series_ticker": "SER",
+                        "open_time": "2026-01-01T00:00:00Z",
+                        "close_time": "2026-01-02T00:00:00Z",
+                    }
+                    for i in range(4)
+                }
+                calls = []
+
+                def fake_get_once(api_path, params=None, timeout=None):
+                    tickers = (params or {}).get("market_tickers", "").split(",")
+                    calls.append(len(tickers))
+                    if len(tickers) > 1:
+                        return None, 400
+                    return {
+                        "markets": [{
+                            "market_ticker": tickers[0],
+                            "candlesticks": [{"end_period_ts": 1, "volume": 1}],
+                        }]
+                    }, 200
+
+                with (
+                    patch.object(collector, "get_once", side_effect=fake_get_once),
+                    patch.object(collector.time, "sleep", return_value=None),
+                ):
+                    result = collector.batch_fetch_candles_live(ticker_meta)
+
+                self.assertEqual(len(result), 4)
+                self.assertIn(1, calls)
+
     def test_validate_scan_quality_flags_partial_scan(self):
         for path in COLLECTOR_PATHS:
             with self.subTest(path=str(path)):

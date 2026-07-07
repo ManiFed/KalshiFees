@@ -107,6 +107,8 @@ CANDLE_TIMEOUT = 90
 MAX_RETRIES = 5
 CHECKPOINT_VERSION = 1
 CHECKPOINT_EVERY = 200
+CANDLE_BATCH_SIZE = 25
+LIVE_PROCESS_CHUNK = 200
 MIN_EXPECTED_MARKETS = 150_000
 MIN_EXPECTED_DATE_SPAN = 30
 
@@ -140,24 +142,58 @@ PERP_MAKER_BPS = 0.00020
 SESSION = requests.Session()
 
 
+def _format_request_error(path: str, params: dict | None, exc: Exception) -> str:
+    if not params:
+        return f"{path}: {exc}"
+    short = dict(params)
+    tickers = short.get("market_tickers")
+    if isinstance(tickers, str) and "," in tickers:
+        parts = tickers.split(",")
+        short["market_tickers"] = f"{len(parts)} tickers ({parts[0]}…)"
+    elif isinstance(tickers, str) and tickers:
+        short["market_tickers"] = tickers[:40] + ("…" if len(tickers) > 40 else "")
+    return f"{path} {short}: {exc}"
+
+
+def get_once(path: str, params: dict = None,
+             timeout: int = REQUEST_TIMEOUT) -> tuple[dict | None, int | None]:
+    """Single GET returning (json_body, status_code). status_code is None on transport failure."""
+    url = BASE_URL + path
+    try:
+        r = SESSION.get(url, params=params, timeout=timeout)
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 10))
+            print(f"    [rate limit] sleeping {wait}s…", flush=True)
+            time.sleep(wait)
+            return None, 429
+        if r.status_code >= 400:
+            return None, r.status_code
+        return r.json(), r.status_code
+    except requests.RequestException as e:
+        print(f"    [error] {_format_request_error(path, params, e)}", flush=True)
+        return None, None
+
+
 def get(path: str, params: dict = None, retries: int = MAX_RETRIES,
         timeout: int = REQUEST_TIMEOUT) -> dict | None:
-    url = BASE_URL + path
     for attempt in range(retries):
-        try:
-            r = SESSION.get(url, params=params, timeout=timeout)
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 10))
-                print(f"    [rate limit] sleeping {wait}s…", flush=True)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
+        data, status = get_once(path, params, timeout=timeout)
+        if status == 429:
+            continue
+        if status is not None and status >= 400:
             if attempt == retries - 1:
-                print(f"    [error] {path}: {e}", flush=True)
+                print(
+                    f"    [error] {_format_request_error(path, params, requests.HTTPError(f'{status}'))}",
+                    flush=True,
+                )
                 return None
             time.sleep(min(60, 2 ** attempt * 3))
+            continue
+        if data is not None:
+            return data
+        if attempt == retries - 1:
+            return None
+        time.sleep(min(60, 2 ** attempt * 3))
     return None
 
 
@@ -407,12 +443,16 @@ def is_intraday(open_time: str, close_time: str) -> bool:
 def candle_period(open_time: str, close_time: str) -> int:
     return 1 if is_intraday(open_time, close_time) else 1440
 
-def candle_time_params(open_time: str = "", close_time: str = "") -> dict[str, int]:
+def candle_time_params(open_time: str = "", close_time: str = "",
+                       cap_end_to_now: bool = False) -> dict[str, int]:
     now = datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
     o = parse_iso(open_time)
     c = parse_iso(close_time)
     start = int((o - timedelta(hours=6)).timestamp()) if o else int((now - timedelta(days=90)).timestamp())
-    end   = int((c + timedelta(hours=6)).timestamp()) if c else int(now.timestamp())
+    end   = int((c + timedelta(hours=6)).timestamp()) if c else now_ts
+    if cap_end_to_now:
+        end = min(end, now_ts + 3600)
     if end <= start:
         end = start + 3600
     return {"start_ts": start, "end_ts": end}
@@ -431,7 +471,10 @@ def fetch_candles_live(series_ticker: str, market_ticker: str,
                        open_time: str = "", close_time: str = "") -> list:
     period = candle_period(open_time, close_time)
     path   = f"/series/{series_ticker}/markets/{market_ticker}/candlesticks"
-    params = {"period_interval": period, **candle_time_params(open_time, close_time)}
+    params = {
+        "period_interval": period,
+        **candle_time_params(open_time, close_time, cap_end_to_now=True),
+    }
     data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
     return data.get("candlesticks", [])
 
@@ -443,10 +486,67 @@ def fetch_candles_historical(market_ticker: str,
     data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
     return data.get("candlesticks", [])
 
+def _batch_candle_window(chunk: list[str], ticker_meta: dict[str, dict]) -> dict[str, int]:
+    starts, ends = [], []
+    for ticker in chunk:
+        meta = ticker_meta.get(ticker, {})
+        bounds = candle_time_params(
+            meta.get("open_time", ""),
+            meta.get("close_time", ""),
+            cap_end_to_now=True,
+        )
+        starts.append(bounds["start_ts"])
+        ends.append(bounds["end_ts"])
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    end_ts = min(max(ends), now_ts + 3600)
+    start_ts = min(starts)
+    max_span = 86400 * 400
+    if end_ts - start_ts > max_span:
+        start_ts = end_ts - max_span
+    return {"start_ts": start_ts, "end_ts": end_ts}
+
+
+def _fetch_candle_batch(chunk: list[str], period: int,
+                        ticker_meta: dict[str, dict]) -> dict[str, list]:
+    if not chunk:
+        return {}
+    window = _batch_candle_window(chunk, ticker_meta)
+    params = {
+        "market_tickers": ",".join(chunk),
+        "period_interval": period,
+        **window,
+    }
+    data, status = get_once("/markets/candlesticks", params, timeout=CANDLE_TIMEOUT)
+    if status == 400 and len(chunk) > 1:
+        mid = len(chunk) // 2
+        left = _fetch_candle_batch(chunk[:mid], period, ticker_meta)
+        right = _fetch_candle_batch(chunk[mid:], period, ticker_meta)
+        left.update(right)
+        return left
+    if status == 400 or data is None:
+        if len(chunk) == 1:
+            ticker = chunk[0]
+            meta = ticker_meta.get(ticker, {})
+            series = meta.get("series_ticker", "")
+            if series:
+                return {ticker: fetch_candles_live(
+                    series, ticker, meta.get("open_time", ""), meta.get("close_time", "")
+                )}
+            print(f"    [warn] batch candle fetch failed for {ticker}", flush=True)
+        return {}
+    result = {}
+    for entry in data.get("markets", []):
+        tk = entry.get("market_ticker", "")
+        cs = entry.get("candlesticks", [])
+        if tk and cs:
+            result[tk] = cs
+    return result
+
+
 def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
     """
-    Batch endpoint: up to 100 tickers per call. Split by period (1 vs 1440)
-    because period_interval is a single parameter for the whole batch.
+    Batch endpoint with small chunks. Split by period (1 vs 1440) because
+    period_interval is a single parameter for the whole batch.
     """
     intraday = [t for t, m in ticker_meta.items()
                 if is_intraday(m.get("open_time", ""), m.get("close_time", ""))]
@@ -454,28 +554,9 @@ def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
     result   = {}
 
     def _batch(tickers: list[str], period: int):
-        for i in range(0, len(tickers), 100):
-            chunk = tickers[i:i+100]
-            starts, ends = [], []
-            for ticker in chunk:
-                meta = ticker_meta.get(ticker, {})
-                bounds = candle_time_params(meta.get("open_time", ""), meta.get("close_time", ""))
-                starts.append(bounds["start_ts"])
-                ends.append(bounds["end_ts"])
-            data = get(
-                "/markets/candlesticks",
-                {
-                    "market_tickers": ",".join(chunk),
-                    "period_interval": period,
-                    "start_ts": min(starts),
-                    "end_ts": max(ends),
-                },
-            ) or {}
-            for entry in data.get("markets", []):
-                tk = entry.get("market_ticker", "")
-                cs = entry.get("candlesticks", [])
-                if tk and cs:
-                    result[tk] = cs
+        for i in range(0, len(tickers), CANDLE_BATCH_SIZE):
+            chunk = tickers[i:i + CANDLE_BATCH_SIZE]
+            result.update(_fetch_candle_batch(chunk, period, ticker_meta))
             time.sleep(DELAY)
 
     if intraday:
@@ -579,6 +660,7 @@ def _empty_checkpoint() -> dict:
         "historical_page_ticker": "",
         "hist_count": 0,
         "live_count": 0,
+        "live_next_index": 0,
         "skipped_zero_vol": 0,
         "no_candles": 0,
         "total_markets": 0,
@@ -683,6 +765,7 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
             "historical_page_ticker": checkpoint.get("historical_page_ticker", ""),
             "hist_count": hist_count,
             "live_count": live_count,
+            "live_next_index": checkpoint.get("live_next_index", 0),
             "skipped_zero_vol": skipped_zero_vol,
             "no_candles": no_candles,
             "total_markets": total_markets,
@@ -721,38 +804,53 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
                 "close_time":    m.get("close_time", ""),
             }
 
-        print("  [A1] Batch-fetching candlesticks…")
-        candle_map = batch_fetch_candles_live(live_meta)
+        sorted_tickers = sorted(live_meta.keys())
+        start_idx = int(checkpoint.get("live_next_index", 0))
+        if start_idx:
+            print(f"  [A1] Resuming live processing at market {start_idx:,}/{len(sorted_tickers):,}")
 
-        for ticker, meta in live_meta.items():
-            candles = candle_map.get(ticker, [])
-            if not candles and meta["series_ticker"]:
-                candles = fetch_candles_live(meta["series_ticker"], ticker,
-                                             meta["open_time"], meta["close_time"])
-                time.sleep(DELAY)
+        for chunk_start in range(start_idx, len(sorted_tickers), LIVE_PROCESS_CHUNK):
+            chunk_tickers = sorted_tickers[chunk_start:chunk_start + LIVE_PROCESS_CHUNK]
+            chunk_meta = {t: live_meta[t] for t in chunk_tickers}
 
-            if not candles:
-                no_candles += 1
-                continue
+            print(f"  [A1] Batch-fetching candlesticks ({chunk_start:,}–"
+                  f"{chunk_start + len(chunk_tickers):,} of {len(sorted_tickers):,})…")
+            candle_map = batch_fetch_candles_live(chunk_meta)
 
-            series   = (meta.get("series_ticker") or ticker.split("-")[0]).upper()
-            category = categorize(ticker, meta["category"])
-            contracts, fee = accumulate_candles(
-                candles, series, category, fee_changes, daily_series, min_date
-            )
-            if contracts == 0:
-                no_candles += 1
-                continue
+            for ticker in chunk_tickers:
+                meta = live_meta[ticker]
+                candles = candle_map.get(ticker, [])
+                if not candles and meta["series_ticker"]:
+                    candles = fetch_candles_live(meta["series_ticker"], ticker,
+                                                 meta["open_time"], meta["close_time"])
+                    time.sleep(DELAY)
 
-            total_markets   += 1
-            live_count      += 1
-            total_contracts += contracts
-            total_fee       += fee
+                if not candles:
+                    no_candles += 1
+                    continue
 
-            if live_count % 500 == 0:
-                print(f"       {live_count:,} live markets | fee ${total_fee:,.0f}", flush=True)
+                series   = (meta.get("series_ticker") or ticker.split("-")[0]).upper()
+                category = categorize(ticker, meta["category"])
+                contracts, fee = accumulate_candles(
+                    candles, series, category, fee_changes, daily_series, min_date
+                )
+                if contracts == 0:
+                    no_candles += 1
+                    continue
+
+                total_markets   += 1
+                live_count      += 1
+                total_contracts += contracts
+                total_fee       += fee
+
+                if live_count % 500 == 0:
+                    print(f"       {live_count:,} live markets | fee ${total_fee:,.0f}", flush=True)
+
+            checkpoint["live_next_index"] = chunk_start + len(chunk_tickers)
+            _persist({"live_complete": False, "live_next_index": checkpoint["live_next_index"]})
 
         checkpoint["live_complete"] = True
+        checkpoint["live_next_index"] = len(sorted_tickers)
         _persist()
         print(f"  [A1] Done. {live_count:,} live markets processed.")
 
