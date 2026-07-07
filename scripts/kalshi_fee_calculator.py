@@ -486,6 +486,18 @@ def fetch_candles_historical(market_ticker: str,
     data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
     return data.get("candlesticks", [])
 
+def _market_open_ts(meta: dict) -> int:
+    o = parse_iso(meta.get("open_time", ""))
+    return int(o.timestamp()) if o else 0
+
+
+def _open_quarter_key(meta: dict) -> tuple[int, int]:
+    o = parse_iso(meta.get("open_time", ""))
+    if not o:
+        return (0, 0)
+    return (o.year, (o.month - 1) // 3)
+
+
 def _batch_candle_window(chunk: list[str], ticker_meta: dict[str, dict]) -> dict[str, int]:
     starts, ends = [], []
     for ticker in chunk:
@@ -499,11 +511,7 @@ def _batch_candle_window(chunk: list[str], ticker_meta: dict[str, dict]) -> dict
         ends.append(bounds["end_ts"])
     now_ts = int(datetime.now(timezone.utc).timestamp())
     end_ts = min(max(ends), now_ts + 3600)
-    start_ts = min(starts)
-    max_span = 86400 * 400
-    if end_ts - start_ts > max_span:
-        start_ts = end_ts - max_span
-    return {"start_ts": start_ts, "end_ts": end_ts}
+    return {"start_ts": min(starts), "end_ts": end_ts}
 
 
 def _fetch_candle_batch(chunk: list[str], period: int,
@@ -554,10 +562,15 @@ def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
     result   = {}
 
     def _batch(tickers: list[str], period: int):
-        for i in range(0, len(tickers), CANDLE_BATCH_SIZE):
-            chunk = tickers[i:i + CANDLE_BATCH_SIZE]
-            result.update(_fetch_candle_batch(chunk, period, ticker_meta))
-            time.sleep(DELAY)
+        by_quarter: dict[tuple[int, int], list[str]] = defaultdict(list)
+        for ticker in tickers:
+            by_quarter[_open_quarter_key(ticker_meta.get(ticker, {}))].append(ticker)
+        for quarter_tickers in by_quarter.values():
+            quarter_tickers.sort(key=lambda t: _market_open_ts(ticker_meta.get(t, {})))
+            for i in range(0, len(quarter_tickers), CANDLE_BATCH_SIZE):
+                chunk = quarter_tickers[i:i + CANDLE_BATCH_SIZE]
+                result.update(_fetch_candle_batch(chunk, period, ticker_meta))
+                time.sleep(DELAY)
 
     if intraday:
         print(f"       {len(intraday):,} intraday markets → 1-min candles", flush=True)
