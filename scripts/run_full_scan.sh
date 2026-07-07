@@ -11,12 +11,21 @@ OUTPUT_DIR="${OUTPUT_DIR:-.}"
 LOG="${LOG:-logs/full-scan.log}"
 
 mkdir -p "$(dirname "$CHECKPOINT")" "$(dirname "$LOG")"
-pip install -q -r requirements.txt
+
+PYTHON="${PYTHON:-}"
+if [[ -z "$PYTHON" ]]; then
+  if [[ -x "$ROOT/venv/bin/python" ]]; then
+    PYTHON="$ROOT/venv/bin/python"
+  else
+    PYTHON="python3"
+  fi
+fi
+"$PYTHON" -m pip install -q -r requirements.txt
 
 echo "=== Kalshi full scan started $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" | tee -a "$LOG"
 
 while true; do
-  if PYTHONUNBUFFERED=1 python3 scripts/kalshi_fee_calculator.py \
+  if PYTHONUNBUFFERED=1 "$PYTHON" scripts/kalshi_fee_calculator.py \
       --output-dir "$OUTPUT_DIR" \
       --checkpoint "$CHECKPOINT" \
       --resume \
