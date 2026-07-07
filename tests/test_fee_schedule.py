@@ -69,6 +69,19 @@ class FeeScheduleTests(unittest.TestCase):
         self.assertEqual(self.c.listing_volume({"volume_fp": "0.00"}), 0.0)
         self.assertEqual(self.c.listing_volume({"volume_fp": "12.50"}), 12.5)
 
+    def test_mve_sports_series_gets_maker_fees_post_oct_2025(self):
+        fee = self.c.contract_fees(
+            10.0, 0.50, "KXMVESPORTSMULTIGAMEEXTENDED",
+            datetime(2026, 2, 1, tzinfo=timezone.utc), {},
+        )
+        taker_per = self.c.math.ceil(0.07 * 0.25 * 100) / 100
+        maker_per = self.c.math.ceil(0.0175 * 0.25 * 100) / 100
+        self.assertAlmostEqual(fee, (taker_per + maker_per) * 10.0)
+
+    def test_normalize_ts_handles_milliseconds(self):
+        self.assertEqual(self.c.normalize_ts(1_700_000_000_000), 1_700_000_000)
+        self.assertEqual(self.c.normalize_ts(1_700_000_000), 1_700_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

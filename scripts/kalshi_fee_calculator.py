@@ -84,10 +84,13 @@ USAGE
   python kalshi_fee_calculator.py --skip-live        # historical markets only (bootstrap)
   python kalshi_fee_calculator.py --skip-perps
   python kalshi_fee_calculator.py --output-dir ./outputs
+  python kalshi_fee_calculator.py --checkpoint data/scan.json --resume  # VPS full scan
+  python kalshi_fee_calculator.py --checkpoint data/scan.json --resume --fail-on-incomplete
 """
 
 import math
 import csv
+import json
 import time
 import argparse
 import requests
@@ -99,6 +102,13 @@ from collections import defaultdict
 BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DELAY    = 0.12
 MAX_PAGES = 2000
+REQUEST_TIMEOUT = 45
+CANDLE_TIMEOUT = 90
+MAX_RETRIES = 5
+CHECKPOINT_VERSION = 1
+CHECKPOINT_EVERY = 200
+MIN_EXPECTED_MARKETS = 150_000
+MIN_EXPECTED_DATE_SPAN = 30
 
 # ── Fee constants (Kalshi fee schedule: 0.07 × C × P × (1-P), maker = 25% of taker) ─
 STANDARD_TAKER = 0.07
@@ -109,6 +119,12 @@ PRE_MAKER_FEES_CUTOFF = datetime(2025, 10, 1, tzinfo=timezone.utc)
 
 # Zero-fee series (fee_multiplier=0 in GET /series/{ticker}); kept as fallback.
 ZERO_FEE_SERIES = frozenset({"KXBTCY", "KXCITRINI", "KXDOED"})
+
+MVE_SPORTS_MAKER_PREFIXES = (
+    "KXMVESPORTSMULTIGAMEEXTENDED",
+    "KXMVESPORTSMULTIGAME",
+    "KXMVECROSSCATEGORY",
+)
 
 _series_fee_cache: dict[str, tuple[float, str]] = {}
 
@@ -123,11 +139,13 @@ PERP_MAKER_BPS = 0.00020
 
 SESSION = requests.Session()
 
-def get(path: str, params: dict = None, retries: int = 3) -> dict:
+
+def get(path: str, params: dict = None, retries: int = MAX_RETRIES,
+        timeout: int = REQUEST_TIMEOUT) -> dict | None:
     url = BASE_URL + path
     for attempt in range(retries):
         try:
-            r = SESSION.get(url, params=params, timeout=15)
+            r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 10))
                 print(f"    [rate limit] sleeping {wait}s…", flush=True)
@@ -138,17 +156,37 @@ def get(path: str, params: dict = None, retries: int = 3) -> dict:
         except requests.RequestException as e:
             if attempt == retries - 1:
                 print(f"    [error] {path}: {e}", flush=True)
-                return {}
-            time.sleep(2 ** attempt)
-    return {}
+                return None
+            time.sleep(min(60, 2 ** attempt * 3))
+    return None
 
-def paginate(path: str, result_key: str, params: dict = None):
+
+def fetch_page(path: str, result_key: str, params: dict | None = None,
+               cursor: str = "") -> dict | None:
+    """Fetch one paginated API page; None on hard failure (caller should checkpoint)."""
+    page_params = dict(params or {})
+    page_params.setdefault("limit", 1000)
+    if cursor:
+        page_params["cursor"] = cursor
+    data = get(path, page_params)
+    if data is None or result_key not in data:
+        return None
+    return data
+
+
+def paginate(path: str, result_key: str, params: dict = None,
+             start_cursor: str = ""):
     params = dict(params or {})
     params.setdefault("limit", 1000)
+    cursor = start_cursor
     pages = 0
     total = 0
-    while True:
-        data = get(path, params)
+    while pages < MAX_PAGES:
+        data = fetch_page(path, result_key, params, cursor)
+        if data is None:
+            print(f"\n  ⚠ WARNING: pagination failed for {path} at cursor "
+                  f"({total} items retrieved, results INCOMPLETE)\n", flush=True)
+            break
         items = data.get(result_key, [])
         if not items:
             break
@@ -158,12 +196,10 @@ def paginate(path: str, result_key: str, params: dict = None):
         pages += 1
         if not cursor:
             break
-        if pages >= MAX_PAGES:
-            print(f"\n  ⚠ WARNING: pagination ceiling hit for {path} "
-                  f"({total} items retrieved, results INCOMPLETE)\n", flush=True)
-            break
-        params["cursor"] = cursor
         time.sleep(DELAY)
+    if pages >= MAX_PAGES:
+        print(f"\n  ⚠ WARNING: pagination ceiling hit for {path} "
+              f"({total} items retrieved, results INCOMPLETE)\n", flush=True)
 
 
 # ── Timestamp / date helpers ──────────────────────────────────────────────────
@@ -177,6 +213,16 @@ def parse_iso(s: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+def normalize_ts(raw) -> int | None:
+    """Normalize candle end_period_ts (seconds or milliseconds) to Unix seconds."""
+    if raw is None:
+        return None
+    ts = int(raw)
+    if ts > 1_000_000_000_000:
+        ts //= 1000
+    return ts
+
 
 def ts_to_date(ts: int) -> str:
     """Unix timestamp → 'YYYY-MM-DD' string in UTC."""
@@ -197,7 +243,7 @@ def load_fee_changes() -> dict[str, list[tuple[datetime, float, str]]]:
     sorted ascending. fee_multiplier is a scale on the standard 0.07 / 0.0175 rates
     (e.g. 0.5 → half fees for INX/Nasdaq daily markets; 0 → zero-fee).
     """
-    data = get("/series/fee_changes", {"show_historical": True})
+    data = get("/series/fee_changes", {"show_historical": True}) or {}
     changes_raw = data.get("series_fee_change_arr", [])
 
     result: dict[str, list[tuple[datetime, float, str]]] = defaultdict(list)
@@ -223,10 +269,13 @@ def load_fee_changes() -> dict[str, list[tuple[datetime, float, str]]]:
 def get_series_fee_default(series: str) -> tuple[float, str]:
     if series in _series_fee_cache:
         return _series_fee_cache[series]
-    data = get(f"/series/{series}")
+    data = get(f"/series/{series}", retries=3, timeout=20) or {}
     meta = data.get("series", data) if isinstance(data, dict) else {}
-    mult = float(meta.get("fee_multiplier", 1))
-    ftype = meta.get("fee_type", "quadratic")
+    if not meta:
+        mult, ftype = 1.0, "quadratic"
+    else:
+        mult = float(meta.get("fee_multiplier", 1))
+        ftype = meta.get("fee_type", "quadratic")
     _series_fee_cache[series] = (mult, ftype)
     return mult, ftype
 
@@ -255,6 +304,8 @@ def fee_state_at(series: str, dt: datetime,
     mult, ftype = get_series_fee_default(series)
     if dt < PRE_MAKER_FEES_CUTOFF:
         return mult, "quadratic"
+    if ftype == "quadratic" and any(series.startswith(p) for p in MVE_SPORTS_MAKER_PREFIXES):
+        return mult, "quadratic_with_maker_fees"
     return mult, ftype
 
 
@@ -381,14 +432,16 @@ def fetch_candles_live(series_ticker: str, market_ticker: str,
     period = candle_period(open_time, close_time)
     path   = f"/series/{series_ticker}/markets/{market_ticker}/candlesticks"
     params = {"period_interval": period, **candle_time_params(open_time, close_time)}
-    return get(path, params).get("candlesticks", [])
+    data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
+    return data.get("candlesticks", [])
 
 def fetch_candles_historical(market_ticker: str,
                               open_time: str = "", close_time: str = "") -> list:
     period = candle_period(open_time, close_time)
     path   = f"/historical/markets/{market_ticker}/candlesticks"
     params = {"period_interval": period, **candle_time_params(open_time, close_time)}
-    return get(path, params).get("candlesticks", [])
+    data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
+    return data.get("candlesticks", [])
 
 def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
     """
@@ -417,7 +470,7 @@ def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
                     "start_ts": min(starts),
                     "end_ts": max(ends),
                 },
-            )
+            ) or {}
             for entry in data.get("markets", []):
                 tk = entry.get("market_ticker", "")
                 cs = entry.get("candlesticks", [])
@@ -482,15 +535,15 @@ def accumulate_candles(candles: list, series: str, category: str,
     total_fee       = 0.0
 
     for c in candles:
-        end_ts = c.get("end_period_ts")
+        end_ts = normalize_ts(c.get("end_period_ts"))
         if end_ts is None:
             continue
 
-        date_str = ts_to_date(int(end_ts))
+        date_str = ts_to_date(end_ts)
         if min_date and date_str < min_date:
             continue
 
-        candle_dt = datetime.fromtimestamp(int(end_ts), tz=timezone.utc)
+        candle_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         vol = float(c.get("volume_fp") or c.get("volume") or 0)
 
         fee = candle_fee(c, series, candle_dt, fee_changes)
@@ -503,23 +556,151 @@ def accumulate_candles(candles: list, series: str, category: str,
     return total_contracts, total_fee
 
 
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+def _load_daily_series(raw: dict) -> dict[str, dict[str, float]]:
+    daily_series: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for date, cats in (raw or {}).items():
+        for cat, fee in cats.items():
+            daily_series[date][cat] = float(fee)
+    return daily_series
+
+
+def _serialize_daily_series(daily_series: dict) -> dict:
+    return {d: {c: round(v, 6) for c, v in cats.items()} for d, cats in daily_series.items()}
+
+
+def _empty_checkpoint() -> dict:
+    return {
+        "version": CHECKPOINT_VERSION,
+        "live_complete": False,
+        "historical_complete": False,
+        "historical_cursor": "",
+        "historical_page_ticker": "",
+        "hist_count": 0,
+        "live_count": 0,
+        "skipped_zero_vol": 0,
+        "no_candles": 0,
+        "total_markets": 0,
+        "total_contracts": 0.0,
+        "total_fee": 0.0,
+        "daily_series": {},
+    }
+
+
+def load_checkpoint(path: str | None) -> dict | None:
+    if not path:
+        return None
+    checkpoint_path = Path(path).expanduser()
+    if not checkpoint_path.exists():
+        return None
+    with checkpoint_path.open() as handle:
+        data = json.load(handle)
+    if data.get("version") != CHECKPOINT_VERSION:
+        print(f"  ⚠ Checkpoint version mismatch at {checkpoint_path}; starting fresh.")
+        return None
+    return data
+
+
+def save_checkpoint(path: str | None, state: dict):
+    if not path:
+        return
+    checkpoint_path = Path(path).expanduser()
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(state)
+    payload["daily_series"] = _serialize_daily_series(
+        _load_daily_series(payload.get("daily_series", {}))
+    )
+    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    with tmp_path.open("w") as handle:
+        json.dump(payload, handle)
+    tmp_path.replace(checkpoint_path)
+    print(f"  [checkpoint] saved → {checkpoint_path}", flush=True)
+
+
+def _process_one_market(m: dict, fee_changes: dict, daily_series: dict,
+                        min_date: str | None) -> tuple[float, float, bool, bool]:
+    """Returns (contracts, fee, skipped_zero_vol, no_candles)."""
+    ticker = m.get("ticker", "")
+    open_time = m.get("open_time", "")
+    close_time = m.get("close_time", "")
+    api_cat = m.get("category", "")
+
+    if min_date and close_time and close_time[:10] < min_date:
+        return 0.0, 0.0, False, False
+
+    if listing_volume(m) <= 0:
+        return 0.0, 0.0, True, False
+
+    candles = fetch_candles_historical(ticker, open_time, close_time)
+    time.sleep(DELAY)
+    if not candles:
+        return 0.0, 0.0, False, True
+
+    series = (m.get("series_ticker") or ticker.split("-")[0]).upper()
+    category = categorize(ticker, api_cat)
+    contracts, fee = accumulate_candles(
+        candles, series, category, fee_changes, daily_series, min_date
+    )
+    if contracts == 0:
+        return 0.0, 0.0, False, True
+    return contracts, fee, False, False
+
+
 # ── Part A: Event Contracts ───────────────────────────────────────────────────
 
 def process_event_contracts(fee_changes: dict, min_date: str | None,
-                             skip_live: bool = False) -> dict:
+                             skip_live: bool = False,
+                             checkpoint_path: str | None = None,
+                             resume: bool = False) -> dict:
     print("\n══ PART A: EVENT CONTRACTS ══════════════════════════════════")
 
-    # daily_series[date][category] = fee
-    daily_series: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    checkpoint = _empty_checkpoint()
+    if resume:
+        loaded = load_checkpoint(checkpoint_path)
+        if loaded:
+            checkpoint.update(loaded)
+            print(f"  [checkpoint] resuming ({checkpoint['total_markets']:,} markets, "
+                  f"${checkpoint['total_fee']:,.0f} fees so far)")
+        elif checkpoint_path:
+            print(f"  [checkpoint] no file at {checkpoint_path}; starting fresh.")
 
-    total_markets   = 0
-    total_contracts = 0.0
-    total_fee       = 0.0
-    no_candles      = 0
+    daily_series = _load_daily_series(checkpoint.get("daily_series", {}))
+    total_markets = int(checkpoint.get("total_markets", 0))
+    total_contracts = float(checkpoint.get("total_contracts", 0.0))
+    total_fee = float(checkpoint.get("total_fee", 0.0))
+    no_candles = int(checkpoint.get("no_candles", 0))
+    skipped_zero_vol = int(checkpoint.get("skipped_zero_vol", 0))
+    hist_count = int(checkpoint.get("hist_count", 0))
+    live_count = int(checkpoint.get("live_count", 0))
+
+    def _persist(extra: dict | None = None):
+        state = {
+            "version": CHECKPOINT_VERSION,
+            "live_complete": checkpoint.get("live_complete", False),
+            "historical_complete": checkpoint.get("historical_complete", False),
+            "historical_cursor": checkpoint.get("historical_cursor", ""),
+            "historical_page_ticker": checkpoint.get("historical_page_ticker", ""),
+            "hist_count": hist_count,
+            "live_count": live_count,
+            "skipped_zero_vol": skipped_zero_vol,
+            "no_candles": no_candles,
+            "total_markets": total_markets,
+            "total_contracts": total_contracts,
+            "total_fee": total_fee,
+            "daily_series": daily_series,
+        }
+        if extra:
+            state.update(extra)
+        save_checkpoint(checkpoint_path, state)
+        checkpoint.update(state)
 
     # ── A1: Live markets ──────────────────────────────────────────────────────
     if skip_live:
         print("\n  [A1] Skipping live markets (--skip-live).")
+        checkpoint["live_complete"] = True
+    elif checkpoint.get("live_complete"):
+        print("\n  [A1] Live markets already complete (checkpoint).")
     else:
         print("\n  [A1] Fetching live markets with activity…")
         live_markets = {}
@@ -543,7 +724,6 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
         print("  [A1] Batch-fetching candlesticks…")
         candle_map = batch_fetch_candles_live(live_meta)
 
-        live_processed = 0
         for ticker, meta in live_meta.items():
             candles = candle_map.get(ticker, [])
             if not candles and meta["series_ticker"]:
@@ -565,69 +745,116 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
                 continue
 
             total_markets   += 1
-            live_processed  += 1
+            live_count      += 1
             total_contracts += contracts
             total_fee       += fee
 
-            if live_processed % 500 == 0:
-                print(f"       {live_processed:,} live markets | fee ${total_fee:,.0f}", flush=True)
+            if live_count % 500 == 0:
+                print(f"       {live_count:,} live markets | fee ${total_fee:,.0f}", flush=True)
 
-        print(f"  [A1] Done. {live_processed:,} live markets processed.")
+        checkpoint["live_complete"] = True
+        _persist()
+        print(f"  [A1] Done. {live_count:,} live markets processed.")
 
-    # ── A2: Historical markets ────────────────────────────────────────────────
-    print("\n  [A2] Fetching historical markets…")
-    hist_count = 0
-    skipped_zero_vol = 0
+    # ── A2: Historical markets (resumable pagination) ─────────────────────────
+    historical_complete = bool(checkpoint.get("historical_complete"))
+    if historical_complete:
+        print("\n  [A2] Historical markets already complete (checkpoint).")
+    else:
+        print("\n  [A2] Fetching historical markets…")
+        cursor = checkpoint.get("historical_cursor", "")
+        resume_ticker = checkpoint.get("historical_page_ticker", "")
+        pages = 0
+        skipping = bool(resume_ticker)
 
-    for m in paginate("/historical/markets", "markets"):
-        ticker     = m.get("ticker", "")
-        open_time  = m.get("open_time", "")
-        close_time = m.get("close_time", "")
-        api_cat    = m.get("category", "")
+        while pages < MAX_PAGES:
+            page = fetch_page("/historical/markets", "markets", cursor=cursor)
+            if page is None:
+                _persist({
+                    "historical_complete": False,
+                    "historical_cursor": cursor,
+                    "historical_page_ticker": resume_ticker,
+                })
+                print("  [A2] Pagination interrupted — checkpoint saved; re-run with --resume")
+                break
 
-        # Skip entirely if the whole market closed before our min_date window
-        if min_date and close_time and close_time[:10] < min_date:
-            continue
+            items = page.get("markets", [])
+            if not items:
+                historical_complete = True
+                checkpoint["historical_complete"] = True
+                checkpoint["historical_cursor"] = ""
+                checkpoint["historical_page_ticker"] = ""
+                _persist()
+                break
 
-        if listing_volume(m) <= 0:
-            skipped_zero_vol += 1
-            continue
+            for m in items:
+                ticker = m.get("ticker", "")
+                if skipping:
+                    if ticker != resume_ticker:
+                        continue
+                    skipping = False
+                    continue
 
-        candles = fetch_candles_historical(ticker, open_time, close_time)
-        time.sleep(DELAY)
+                contracts, fee, skipped, missing = _process_one_market(
+                    m, fee_changes, daily_series, min_date
+                )
+                if skipped:
+                    skipped_zero_vol += 1
+                    checkpoint["historical_page_ticker"] = ticker
+                    continue
+                if missing:
+                    no_candles += 1
+                    checkpoint["historical_page_ticker"] = ticker
+                    continue
 
-        if not candles:
-            no_candles += 1
-            continue
+                total_markets += 1
+                hist_count += 1
+                total_contracts += contracts
+                total_fee += fee
+                checkpoint["historical_page_ticker"] = ticker
 
-        series   = (m.get("series_ticker") or ticker.split("-")[0]).upper()
-        category = categorize(ticker, api_cat)
-        contracts, fee = accumulate_candles(
-            candles, series, category, fee_changes, daily_series, min_date
-        )
-        if contracts == 0:
-            no_candles += 1
-            continue
+                if hist_count % CHECKPOINT_EVERY == 0:
+                    print(f"       {hist_count:,} historical | fee ${total_fee:,.0f}", flush=True)
+                    _persist({"historical_complete": False, "historical_cursor": cursor})
 
-        total_markets   += 1
-        hist_count      += 1
-        total_contracts += contracts
-        total_fee       += fee
+            next_cursor = page.get("cursor", "")
+            pages += 1
+            if not next_cursor:
+                historical_complete = True
+                checkpoint["historical_complete"] = True
+                checkpoint["historical_cursor"] = ""
+                checkpoint["historical_page_ticker"] = ""
+                _persist()
+                break
 
-        if hist_count % 200 == 0:
-            print(f"       {hist_count:,} historical | fee ${total_fee:,.0f}", flush=True)
+            cursor = next_cursor
+            checkpoint["historical_cursor"] = cursor
+            checkpoint["historical_page_ticker"] = ""
+            resume_ticker = ""
+            skipping = False
+            _persist({"historical_complete": False})
+            time.sleep(DELAY)
 
-    print(f"  [A2] Done. {hist_count:,} historical markets processed.")
-    if skipped_zero_vol:
-        print(f"  Note: {skipped_zero_vol:,} zero-volume markets skipped (no candle fetch).")
-    if no_candles:
-        print(f"  Note: {no_candles:,} markets had no usable candle data.")
+        if pages >= MAX_PAGES:
+            print(f"\n  ⚠ WARNING: historical pagination ceiling hit ({hist_count:,} markets)\n",
+                  flush=True)
+
+        print(f"  [A2] Done. {hist_count:,} historical markets processed.")
+        if skipped_zero_vol:
+            print(f"  Note: {skipped_zero_vol:,} zero-volume markets skipped (no candle fetch).")
+        if no_candles:
+            print(f"  Note: {no_candles:,} markets had no usable candle data.")
 
     return {
-        "total_markets":   total_markets,
+        "total_markets": total_markets,
         "total_contracts": total_contracts,
-        "total_fee":       total_fee,
-        "daily_series":    {d: dict(cats) for d, cats in daily_series.items()},
+        "total_fee": total_fee,
+        "daily_series": {d: dict(cats) for d, cats in daily_series.items()},
+        "historical_complete": historical_complete,
+        "live_complete": bool(checkpoint.get("live_complete")),
+        "skip_live": skip_live,
+        "hist_count": hist_count,
+        "live_count": live_count,
     }
 
 
@@ -675,6 +902,41 @@ def process_perps(min_date: str | None) -> dict:
 
     return {"total_fee": total_fee, "total_notional": total_notional,
             "daily_series": {}, "note": note, "all_time_adjustment": True}
+
+
+# ── Scan validation ───────────────────────────────────────────────────────────
+
+def validate_scan_quality(event: dict) -> list[str]:
+    """Return human-readable warnings when a scan looks incomplete or biased."""
+    warnings: list[str] = []
+    dates = sorted(event.get("daily_series", {}))
+    hist_count = int(event.get("hist_count", 0))
+    total_markets = int(event.get("total_markets", 0))
+
+    if not event.get("historical_complete", True):
+        warnings.append("Historical pagination did not finish — re-run with --resume")
+    if event.get("skip_live"):
+        warnings.append("Live markets were skipped (--skip-live); totals exclude open-market volume")
+    elif not event.get("live_complete", True):
+        warnings.append("Live market pass did not complete")
+
+    if hist_count < MIN_EXPECTED_MARKETS:
+        warnings.append(
+            f"Only {hist_count:,} historical markets processed (expected {MIN_EXPECTED_MARKETS:,}+)"
+        )
+    if len(dates) < MIN_EXPECTED_DATE_SPAN:
+        warnings.append(
+            f"Only {len(dates)} distinct fee dates (expected {MIN_EXPECTED_DATE_SPAN}+ spanning years)"
+        )
+    if dates and dates[0] > "2020-01-01":
+        warnings.append(
+            f"Earliest fee date is {dates[0]} — likely a recency-biased partial scan"
+        )
+    if total_markets and event.get("total_fee", 0) / total_markets < 5:
+        warnings.append(
+            f"Average fee/market is only ${event['total_fee']/total_markets:.2f} — verify date span"
+        )
+    return warnings
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
@@ -800,6 +1062,13 @@ def print_and_save(event: dict, perps: dict, output_dir: str):
     print("  - Funding rate excluded (trader-to-trader, not to Kalshi)")
     print("═"*52)
 
+    scan_warnings = validate_scan_quality(event)
+    if scan_warnings:
+        print("\n  SCAN QUALITY WARNINGS:")
+        for warning in scan_warnings:
+            print(f"    ⚠ {warning}")
+        print()
+
     # ── CSV outputs ───────────────────────────────────────────────────────────
     output_path = Path(output_dir).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -825,6 +1094,7 @@ def print_and_save(event: dict, perps: dict, output_dir: str):
 
     print(f"\n  Saved: {daily_path}")
     print(f"  Saved: {monthly_path}")
+    return scan_warnings
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -838,6 +1108,12 @@ def main():
     parser.add_argument("--skip-perps",       action="store_true")
     parser.add_argument("--skip-live",        action="store_true",
                         help="Skip open-market scan; use historical markets only")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Checkpoint JSON path for resumable scans (e.g. data/checkpoints/scan.json)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from --checkpoint if present")
+    parser.add_argument("--fail-on-incomplete", action="store_true",
+                        help="Exit with code 2 when scan quality validation fails")
     parser.add_argument("--output-dir", default=".",
                         help="Directory for kalshi_fee_daily.csv and kalshi_fee_monthly.csv (default: current directory)")
     args = parser.parse_args()
@@ -857,7 +1133,8 @@ def main():
     fee_changes = load_fee_changes()
 
     event_results = process_event_contracts(
-        fee_changes, min_date, skip_live=args.skip_live
+        fee_changes, min_date, skip_live=args.skip_live,
+        checkpoint_path=args.checkpoint, resume=args.resume,
     )
 
     perp_results = {"total_fee": 0.0, "total_notional": 0.0,
@@ -866,7 +1143,10 @@ def main():
     if not args.skip_perps:
         perp_results = process_perps(min_date)
 
-    print_and_save(event_results, perp_results, args.output_dir)
+    scan_warnings = print_and_save(event_results, perp_results, args.output_dir)
+    if args.fail_on_incomplete and scan_warnings:
+        print("  Exiting with code 2 (--fail-on-incomplete): scan quality checks failed.")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
