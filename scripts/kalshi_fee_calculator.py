@@ -39,7 +39,8 @@ Step 1 — Load fee change history
 
 Step 2 — Enumerate all markets
   Live:       GET /markets (status=open) twice — mve_filter=exclude then only
-  Historical: GET /historical/markets
+              (binary singles + MVE parlays/combos; parlays → cat_parlays)
+  Historical: GET /historical/markets (includes settled MVE parlays)
 
 Step 3 — Fetch candlestick data per market
   Live batch: GET /markets/candlesticks (market_tickers + start_ts + end_ts)
@@ -110,7 +111,7 @@ MAX_PAGES = 2000
 REQUEST_TIMEOUT = 45
 CANDLE_TIMEOUT = 90
 MAX_RETRIES = 5
-CHECKPOINT_VERSION = 2  # v2: 1-min sports/high-vol, trade fallback, MVE live pass
+CHECKPOINT_VERSION = 3  # v3: parlays as own category (MVE/combos), not folded into sports
 CHECKPOINT_EVERY = 200
 CANDLE_BATCH_SIZE = 25
 LIVE_PROCESS_CHUNK = 200
@@ -483,7 +484,7 @@ def choose_candle_period(open_time: str, close_time: str,
     if hours is not None and 0 < hours < INTRADAY_HOURS:
         return 1
     cat = categorize(ticker, category) if (ticker or category) else (category or "").lower()
-    if cat == "sports":
+    if cat in ("sports", "parlays") or is_parlay_market(ticker):
         return 1
     series = series_ticker_of(ticker)
     if any(series.startswith(p) for p in MVE_SPORTS_MAKER_PREFIXES):
@@ -762,7 +763,6 @@ TICKER_CATEGORY = {
     "KXWC":"sports",    "KXUFC":"sports",    "KXNASCAR":"sports",
     "KXPGA":"sports",   "KXBIG":"sports",    "KXCHAMP":"sports",
     "KXMLS":"sports",   "KXCFL":"sports",    "KXATP":"sports",
-    "KXMVE":"sports",   "KXMVESPORTS":"sports",
     "FED":"economics",  "KXFED":"economics", "KXCPI":"economics",
     "KXGDP":"economics","KXUNEMPLOYMENT":"economics","KXJOBS":"economics",
     "INX":"economics",  "NASDAQ100":"economics","KXEGGS":"economics",
@@ -774,12 +774,41 @@ TICKER_CATEGORY = {
     "KXSNOW":"weather", "KXTEMP":"weather",
 }
 
-def categorize(ticker: str, api_category: str = "") -> str:
-    if api_category and api_category.strip().lower() not in ("", "unknown"):
-        return api_category.strip().lower()
+
+def is_parlay_market(market: dict | str | None = None, ticker: str = "") -> bool:
+    """
+    Kalshi parlays are multivariate events (MVE): multi-leg combos under
+    KXMVESPORTSMULTIGAME*, KXMVECROSSCATEGORY, and related KXMVE* series.
+    """
+    tk = ticker or ""
+    if isinstance(market, dict):
+        if market.get("mve_selected_legs") or market.get("mve_collection_ticker"):
+            return True
+        tk = market.get("ticker") or tk
+        series = series_ticker_of(market)
+    elif isinstance(market, str):
+        tk = market or tk
+        series = series_ticker_of(tk)
+    else:
+        series = series_ticker_of(tk)
+    s = (series or (tk.split("-")[0] if tk else "")).upper()
+    if not s:
+        return False
+    if s.startswith("KXMVE"):
+        return True
+    return any(s.startswith(p) for p in MVE_SPORTS_MAKER_PREFIXES)
+
+
+def categorize(ticker: str, api_category: str = "", market: dict | None = None) -> str:
+    # Parlays first — API often labels them sports/empty; keep them distinct in CSV.
+    if is_parlay_market(market if market is not None else ticker, ticker=ticker):
+        return "parlays"
+    raw = (api_category or "").strip().lower()
+    if raw in ("parlay", "parlays", "mve", "combo", "combos", "multivariate"):
+        return "parlays"
+    if raw and raw not in ("", "unknown"):
+        return raw
     s = ticker.split("-")[0].upper()
-    if any(s.startswith(p) for p in MVE_SPORTS_MAKER_PREFIXES) or s.startswith("KXMVE"):
-        return "sports"
     for prefix, cat in TICKER_CATEGORY.items():
         if s.startswith(prefix):
             return cat
@@ -989,13 +1018,15 @@ def _recover_market_activity(
 
 def market_slim_meta(market: dict) -> dict:
     """Keep only fields needed for fee recovery (full market payloads OOMs on small VPS)."""
+    ticker = market.get("ticker", "") or ""
     return {
-        "ticker": market.get("ticker", ""),
+        "ticker": ticker,
         "series_ticker": series_ticker_of(market),
-        "category": market.get("category", "") or "",
+        "category": categorize(ticker, market.get("category", "") or "", market),
         "open_time": market.get("open_time", "") or "",
         "close_time": market.get("close_time", "") or "",
         "listing_volume": listing_volume(market),
+        "is_parlay": is_parlay_market(market, ticker=ticker),
     }
 
 
@@ -1072,7 +1103,7 @@ def _process_one_market(m: dict, fee_changes: dict, daily_series: dict,
         return 0.0, 0.0, True, False
 
     series = series_ticker_of(m)
-    category = categorize(ticker, api_cat)
+    category = categorize(ticker, api_cat, m)
     contracts, fee, missing = _recover_market_activity(
         ticker, series, category, open_time, close_time, listing,
         fee_changes, daily_series, min_date, live=False,
@@ -1188,7 +1219,10 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
             for ticker in chunk_tickers:
                 meta = chunk_meta[ticker]
                 series = series_ticker_of(ticker, meta.get("series_ticker", ""))
-                category = categorize(ticker, meta.get("category", ""))
+                # Prefer resolved category from index (includes parlays); re-check ticker.
+                category = meta.get("category") or categorize(ticker)
+                if meta.get("is_parlay") or is_parlay_market(ticker):
+                    category = "parlays"
                 listing = float(meta.get("listing_volume") or 0)
                 period = choose_candle_period(
                     meta.get("open_time", ""),

@@ -207,6 +207,38 @@ class CollectorRegressionTests(unittest.TestCase):
                     "KXATP",
                 )
 
+    def test_parlays_are_own_category_not_sports(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                mve = {
+                    "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S1-ABC",
+                    "series_ticker": None,
+                    "category": "Sports",
+                    "mve_selected_legs": [{"market_ticker": "KXATP-1", "side": "yes"}],
+                    "volume_fp": "10.00",
+                }
+                self.assertTrue(collector.is_parlay_market(mve))
+                self.assertEqual(collector.categorize(mve["ticker"], "Sports", mve), "parlays")
+                self.assertEqual(
+                    collector.categorize("KXMVECROSSCATEGORY-S1-XYZ", ""),
+                    "parlays",
+                )
+                self.assertEqual(collector.categorize("KXATP-MATCH-1", "sports"), "sports")
+                self.assertEqual(collector.market_slim_meta(mve)["category"], "parlays")
+                self.assertTrue(collector.market_slim_meta(mve)["is_parlay"])
+                # 1-min candles for parlays (same under-recovery risk as sports)
+                self.assertEqual(
+                    collector.choose_candle_period(
+                        "2026-03-01T00:00:00Z",
+                        "2026-03-10T00:00:00Z",
+                        category="parlays",
+                        listing_vol=5000,
+                        ticker=mve["ticker"],
+                    ),
+                    1,
+                )
+
     def test_choose_candle_period_prefers_one_min_for_sports(self):
         for path in COLLECTOR_PATHS:
             with self.subTest(path=str(path)):
@@ -318,6 +350,17 @@ class CollectorRegressionTests(unittest.TestCase):
 
                 self.assertEqual(filters_seen, ["exclude", "only"])
                 self.assertEqual(result["live_count"], 2)
+                # MVE leg should land in parlays, not sports
+                parlays_fee = sum(
+                    cats.get("parlays", 0.0)
+                    for cats in result["daily_series"].values()
+                )
+                sports_fee = sum(
+                    cats.get("sports", 0.0)
+                    for cats in result["daily_series"].values()
+                )
+                self.assertGreater(parlays_fee, 0)
+                self.assertGreater(sports_fee, 0)
 
 
 if __name__ == "__main__":
