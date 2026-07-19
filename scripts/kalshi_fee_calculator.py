@@ -92,9 +92,12 @@ USAGE
 
 import math
 import csv
+import gc
 import json
+import os
 import time
 import argparse
+import tempfile
 import requests
 from bisect import bisect_right
 from pathlib import Path
@@ -588,17 +591,15 @@ def fetch_candles_historical(market_ticker: str,
     return _fetch_candles_chunked(path, period, open_time, close_time, cap_end_to_now=False)
 
 
-def fetch_all_trades(market_ticker: str, open_time: str = "", close_time: str = "",
-                     max_pages: int = TRADE_FALLBACK_MAX_PAGES) -> list:
-    """Paginate GET /markets/trades for exact fill-level volume and fees."""
+def iter_trade_pages(market_ticker: str, open_time: str = "", close_time: str = "",
+                     max_pages: int = TRADE_FALLBACK_MAX_PAGES):
+    """Yield trade pages from GET /markets/trades (avoids holding full history in RAM)."""
     params: dict = {"ticker": market_ticker, "limit": 1000}
     bounds = candle_time_params(open_time, close_time) if (open_time or close_time) else None
-    # Filter client-side when API omits time bounds; still pass if supported.
     if bounds:
         params["min_ts"] = bounds["start_ts"]
         params["max_ts"] = bounds["end_ts"]
 
-    trades: list = []
     cursor = ""
     pages = 0
     while pages < max_pages:
@@ -607,7 +608,6 @@ def fetch_all_trades(market_ticker: str, open_time: str = "", close_time: str = 
             page_params["cursor"] = cursor
         data = get("/markets/trades", page_params, timeout=REQUEST_TIMEOUT)
         if data is None:
-            # Retry without time filters if API rejects them
             if pages == 0 and ("min_ts" in params or "max_ts" in params):
                 params.pop("min_ts", None)
                 params.pop("max_ts", None)
@@ -616,13 +616,35 @@ def fetch_all_trades(market_ticker: str, open_time: str = "", close_time: str = 
         items = data.get("trades", [])
         if not items:
             break
-        trades.extend(items)
+        yield items
         cursor = data.get("cursor", "") or ""
         pages += 1
         if not cursor:
             break
         time.sleep(DELAY)
+
+
+def fetch_all_trades(market_ticker: str, open_time: str = "", close_time: str = "",
+                     max_pages: int = TRADE_FALLBACK_MAX_PAGES) -> list:
+    """Paginate GET /markets/trades for exact fill-level volume and fees."""
+    trades: list = []
+    for page in iter_trade_pages(market_ticker, open_time, close_time, max_pages=max_pages):
+        trades.extend(page)
     return trades
+
+
+def accumulate_trades_streaming(market_ticker: str, series: str, category: str,
+                                fee_changes: dict, daily_series: dict,
+                                min_date: str | None,
+                                open_time: str = "", close_time: str = "") -> tuple[float, float]:
+    """Accumulate fill fees page-by-page without retaining the full trade list."""
+    total_contracts = 0.0
+    total_fee = 0.0
+    for page in iter_trade_pages(market_ticker, open_time, close_time):
+        c, f = accumulate_trades(page, series, category, fee_changes, daily_series, min_date)
+        total_contracts += c
+        total_fee += f
+    return total_contracts, total_fee
 
 def _market_open_ts(meta: dict) -> int:
     o = parse_iso(meta.get("open_time", ""))
@@ -844,6 +866,7 @@ def _empty_checkpoint() -> dict:
     return {
         "version": CHECKPOINT_VERSION,
         "live_complete": False,
+        "live_index_complete": False,
         "historical_complete": False,
         "historical_cursor": "",
         "historical_page_ticker": "",
@@ -943,14 +966,13 @@ def _recover_market_activity(
         period = 1
 
     if needs_volume_recovery(vol, listing_vol) or not candles or vol <= 0:
-        trades = fetch_all_trades(ticker, open_time, close_time)
+        contracts, fee = accumulate_trades_streaming(
+            ticker, series, category, fee_changes, daily_series, min_date,
+            open_time, close_time,
+        )
         time.sleep(DELAY)
-        if trades:
-            contracts, fee = accumulate_trades(
-                trades, series, category, fee_changes, daily_series, min_date
-            )
-            if contracts > 0:
-                return contracts, fee, False
+        if contracts > 0:
+            return contracts, fee, False
 
     if not candles:
         return 0.0, 0.0, True
@@ -958,9 +980,80 @@ def _recover_market_activity(
     contracts, fee = accumulate_candles(
         candles, series, category, fee_changes, daily_series, min_date
     )
+    # Free per-market candle buffer promptly (1-min series can be large).
+    del candles
     if contracts == 0:
         return 0.0, 0.0, True
     return contracts, fee, False
+
+
+def market_slim_meta(market: dict) -> dict:
+    """Keep only fields needed for fee recovery (full market payloads OOMs on small VPS)."""
+    return {
+        "ticker": market.get("ticker", ""),
+        "series_ticker": series_ticker_of(market),
+        "category": market.get("category", "") or "",
+        "open_time": market.get("open_time", "") or "",
+        "close_time": market.get("close_time", "") or "",
+        "listing_volume": listing_volume(market),
+    }
+
+
+def live_markets_index_path(checkpoint_path: str | None) -> Path | None:
+    if not checkpoint_path:
+        return None
+    return Path(checkpoint_path).expanduser().parent / "live_markets_index.jsonl"
+
+
+def build_live_markets_index(index_path: Path) -> tuple[int, int]:
+    """
+    Stream open markets (binary + MVE) to a slim JSONL index.
+    Returns (active_count, scanned_count).
+    """
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = index_path.with_suffix(index_path.suffix + ".tmp")
+    seen: set[str] = set()
+    active = 0
+    scanned = 0
+    with tmp_path.open("w") as out:
+        for mve_filter in ("exclude", "only"):
+            for m in paginate(
+                "/markets", "markets",
+                {"status": "open", "mve_filter": mve_filter},
+            ):
+                scanned += 1
+                ticker = m.get("ticker") or ""
+                if not ticker or ticker in seen or not market_has_activity(m):
+                    continue
+                seen.add(ticker)
+                out.write(json.dumps(market_slim_meta(m), separators=(",", ":")) + "\n")
+                active += 1
+                if active % 10_000 == 0:
+                    print(f"       indexed {active:,} active open markets "
+                          f"(scanned {scanned:,})…", flush=True)
+    tmp_path.replace(index_path)
+    del seen
+    gc.collect()
+    return active, scanned
+
+
+def count_jsonl_lines(path: Path) -> int:
+    n = 0
+    with path.open() as handle:
+        for _ in handle:
+            n += 1
+    return n
+
+
+def iter_jsonl_from(path: Path, start_idx: int = 0):
+    with path.open() as handle:
+        for i, line in enumerate(handle):
+            if i < start_idx:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            yield i, json.loads(line)
 
 
 def _process_one_market(m: dict, fee_changes: dict, daily_series: dict,
@@ -1020,6 +1113,7 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
         state = {
             "version": CHECKPOINT_VERSION,
             "live_complete": checkpoint.get("live_complete", False),
+            "live_index_complete": checkpoint.get("live_index_complete", False),
             "historical_complete": checkpoint.get("historical_complete", False),
             "historical_cursor": checkpoint.get("historical_cursor", ""),
             "historical_page_ticker": checkpoint.get("historical_page_ticker", ""),
@@ -1046,46 +1140,53 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
         print("\n  [A1] Live markets already complete (checkpoint).")
     else:
         print("\n  [A1] Fetching live markets with activity (binary + MVE)…")
-        live_markets = {}
-        scanned = 0
-        # Dual pass: exclude alone drops parlays/MVE — a large sports fee slice.
-        for mve_filter in ("exclude", "only"):
-            for m in paginate(
-                "/markets", "markets",
-                {"status": "open", "mve_filter": mve_filter},
-            ):
-                scanned += 1
-                ticker = m.get("ticker")
-                if ticker and market_has_activity(m):
-                    live_markets[ticker] = m
-        print(f"       {len(live_markets):,} active open markets (scanned {scanned:,})")
+        # Disk-backed slim index: holding full open-market payloads OOMs a 1GB VPS.
+        index_path = live_markets_index_path(checkpoint_path)
+        tmp_index: Path | None = None
+        if index_path is None:
+            fd, tmp_name = tempfile.mkstemp(prefix="live_markets_", suffix=".jsonl")
+            os.close(fd)
+            tmp_index = Path(tmp_name)
+            index_path = tmp_index
 
-        live_meta = {}
-        for m in live_markets.values():
-            ticker = m["ticker"]
-            live_meta[ticker] = {
-                "series_ticker": series_ticker_of(m),
-                "category":      m.get("category", ""),
-                "open_time":     m.get("open_time", ""),
-                "close_time":    m.get("close_time", ""),
-                "listing_volume": listing_volume(m),
-            }
+        need_rebuild = (
+            not checkpoint.get("live_index_complete")
+            or not index_path.exists()
+            or index_path.stat().st_size == 0
+        )
+        if need_rebuild:
+            active, scanned = build_live_markets_index(index_path)
+            print(f"       {active:,} active open markets (scanned {scanned:,})")
+            checkpoint["live_index_complete"] = True
+            checkpoint["live_next_index"] = 0
+            _persist({
+                "live_complete": False,
+                "live_index_complete": True,
+                "live_next_index": 0,
+            })
+        else:
+            active = count_jsonl_lines(index_path)
+            print(f"       reusing live index ({active:,} markets) at {index_path}")
 
-        sorted_tickers = sorted(live_meta.keys())
         start_idx = int(checkpoint.get("live_next_index", 0))
         if start_idx:
-            print(f"  [A1] Resuming live processing at market {start_idx:,}/{len(sorted_tickers):,}")
+            print(f"  [A1] Resuming live processing at market {start_idx:,}/{active:,}")
 
-        for chunk_start in range(start_idx, len(sorted_tickers), LIVE_PROCESS_CHUNK):
-            chunk_tickers = sorted_tickers[chunk_start:chunk_start + LIVE_PROCESS_CHUNK]
-            chunk_meta = {t: live_meta[t] for t in chunk_tickers}
+        chunk_meta: dict[str, dict] = {}
+        chunk_tickers: list[str] = []
+        chunk_start = start_idx
 
+        def _flush_live_chunk():
+            nonlocal live_count, total_markets, total_contracts, total_fee, no_candles
+            nonlocal chunk_meta, chunk_tickers, chunk_start
+            if not chunk_tickers:
+                return
+            end_idx = chunk_start + len(chunk_tickers)
             print(f"  [A1] Batch-fetching candlesticks ({chunk_start:,}–"
-                  f"{chunk_start + len(chunk_tickers):,} of {len(sorted_tickers):,})…")
+                  f"{end_idx:,} of {active:,})…", flush=True)
             candle_map = batch_fetch_candles_live(chunk_meta)
-
             for ticker in chunk_tickers:
-                meta = live_meta[ticker]
+                meta = chunk_meta[ticker]
                 series = series_ticker_of(ticker, meta.get("series_ticker", ""))
                 category = categorize(ticker, meta.get("category", ""))
                 listing = float(meta.get("listing_volume") or 0)
@@ -1122,12 +1223,34 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
                 if live_count % 500 == 0:
                     print(f"       {live_count:,} live markets | fee ${total_fee:,.0f}", flush=True)
 
-            checkpoint["live_next_index"] = chunk_start + len(chunk_tickers)
-            _persist({"live_complete": False, "live_next_index": checkpoint["live_next_index"]})
+            checkpoint["live_next_index"] = end_idx
+            _persist({"live_complete": False, "live_next_index": end_idx,
+                      "live_index_complete": True})
+            chunk_start = end_idx
+            chunk_meta = {}
+            chunk_tickers = []
+            del candle_map
+            gc.collect()
+
+        for idx, meta in iter_jsonl_from(index_path, start_idx):
+            ticker = meta.get("ticker") or ""
+            if not ticker:
+                continue
+            chunk_tickers.append(ticker)
+            chunk_meta[ticker] = meta
+            if len(chunk_tickers) >= LIVE_PROCESS_CHUNK:
+                _flush_live_chunk()
+        _flush_live_chunk()
 
         checkpoint["live_complete"] = True
-        checkpoint["live_next_index"] = len(sorted_tickers)
-        _persist()
+        checkpoint["live_next_index"] = active
+        _persist({"live_complete": True, "live_next_index": active,
+                  "live_index_complete": True})
+        if tmp_index is not None:
+            try:
+                tmp_index.unlink(missing_ok=True)
+            except OSError:
+                pass
         print(f"  [A1] Done. {live_count:,} live markets processed.")
 
     # ── A2: Historical markets (resumable pagination) ─────────────────────────

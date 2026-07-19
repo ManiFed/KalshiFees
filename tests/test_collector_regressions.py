@@ -259,7 +259,7 @@ class CollectorRegressionTests(unittest.TestCase):
 
                 with (
                     patch.object(collector, "fetch_candles_historical", return_value=weak_candles),
-                    patch.object(collector, "fetch_all_trades", return_value=trades),
+                    patch.object(collector, "iter_trade_pages", return_value=iter([trades])),
                     patch.object(collector.time, "sleep", return_value=None),
                 ):
                     contracts, fee, skipped, missing = collector._process_one_market(
