@@ -192,6 +192,133 @@ class CollectorRegressionTests(unittest.TestCase):
                 self.assertTrue(any("Historical pagination" in w for w in warnings))
                 self.assertTrue(any("Live markets were skipped" in w for w in warnings))
 
+    def test_series_ticker_derived_when_api_omits(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                self.assertEqual(
+                    collector.series_ticker_of(
+                        {"ticker": "KXMVESPORTSMULTIGAME-ABC-DEF", "series_ticker": None}
+                    ),
+                    "KXMVESPORTSMULTIGAME",
+                )
+                self.assertEqual(
+                    collector.series_ticker_of("KXATP-MATCH-1", "  "),
+                    "KXATP",
+                )
+
+    def test_choose_candle_period_prefers_one_min_for_sports(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                # Multi-week sports market must not use daily-only period
+                period = collector.choose_candle_period(
+                    "2026-03-24T00:00:00Z",
+                    "2026-05-12T00:00:00Z",
+                    category="sports",
+                    listing_vol=1_800_000,
+                    ticker="KXATP-MATCH",
+                )
+                self.assertEqual(period, 1)
+                daily = collector.choose_candle_period(
+                    "2025-01-01T00:00:00Z",
+                    "2025-06-01T00:00:00Z",
+                    category="economics",
+                    listing_vol=100,
+                    ticker="KXFED-RATE",
+                )
+                self.assertEqual(daily, 1440)
+
+    def test_needs_volume_recovery_threshold(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                self.assertTrue(collector.needs_volume_recovery(965, 1_813_455))
+                self.assertFalse(collector.needs_volume_recovery(900_000, 1_000_000))
+                self.assertFalse(collector.needs_volume_recovery(0, 100))  # below min listing
+
+    def test_trade_fallback_when_candles_undercount(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                daily = collector.defaultdict(lambda: collector.defaultdict(float))
+                market = {
+                    "ticker": "KXATP-BIG",
+                    "series_ticker": "KXATP",
+                    "category": "sports",
+                    "open_time": "2026-03-24T00:00:00Z",
+                    "close_time": "2026-05-12T00:00:00Z",
+                    "volume_fp": "10000.00",
+                }
+                weak_candles = [{"end_period_ts": 1_700_000_000, "volume": 10, "price": {"mean_dollars": "0.50"}}]
+                trades = [{
+                    "created_time": "2026-04-01T12:00:00Z",
+                    "count_fp": "1000.00",
+                    "yes_price_dollars": "0.50",
+                }]
+
+                with (
+                    patch.object(collector, "fetch_candles_historical", return_value=weak_candles),
+                    patch.object(collector, "fetch_all_trades", return_value=trades),
+                    patch.object(collector.time, "sleep", return_value=None),
+                ):
+                    contracts, fee, skipped, missing = collector._process_one_market(
+                        market, {}, daily, None
+                    )
+
+                self.assertFalse(skipped)
+                self.assertFalse(missing)
+                self.assertEqual(contracts, 1000.0)
+                self.assertGreater(fee, 0)
+                self.assertGreater(daily["2026-04-01"]["sports"], 0)
+
+    def test_live_pass_includes_mve_filter_only(self):
+        for path in COLLECTOR_PATHS:
+            with self.subTest(path=str(path)):
+                collector = load_collector(path)
+                filters_seen = []
+
+                def fake_paginate(api_path, result_key, params=None, start_cursor=""):
+                    if api_path == "/markets":
+                        filters_seen.append((params or {}).get("mve_filter"))
+                        if (params or {}).get("mve_filter") == "only":
+                            return iter([{
+                                "ticker": "KXMVESPORTS-1",
+                                "series_ticker": None,
+                                "category": "",
+                                "open_time": "2026-01-01T00:00:00Z",
+                                "close_time": "2026-01-02T00:00:00Z",
+                                "volume_fp": "50.00",
+                            }])
+                        return iter([{
+                            "ticker": "KXATP-1",
+                            "series_ticker": "KXATP",
+                            "category": "sports",
+                            "open_time": "2026-01-01T00:00:00Z",
+                            "close_time": "2026-01-02T00:00:00Z",
+                            "volume_fp": "50.00",
+                        }])
+                    return iter(())
+
+                with (
+                    patch.object(collector, "paginate", side_effect=fake_paginate),
+                    patch.object(collector, "fetch_page", return_value={"markets": [], "cursor": ""}),
+                    patch.object(
+                        collector,
+                        "batch_fetch_candles_live",
+                        return_value={
+                            "KXATP-1": [{"end_period_ts": 1, "volume": 10, "price": {"mean_dollars": "0.5"}}],
+                            "KXMVESPORTS-1": [{"end_period_ts": 1, "volume": 10, "price": {"mean_dollars": "0.5"}}],
+                        },
+                    ),
+                    patch.object(collector, "save_checkpoint", return_value=None),
+                    patch.object(collector.time, "sleep", return_value=None),
+                ):
+                    result = collector.process_event_contracts({}, None)
+
+                self.assertEqual(filters_seen, ["exclude", "only"])
+                self.assertEqual(result["live_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

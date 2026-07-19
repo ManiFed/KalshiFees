@@ -38,15 +38,17 @@ Step 1 — Load fee change history
   GET /series/{ticker} → fallback multiplier for series absent from the change log
 
 Step 2 — Enumerate all markets
-  Live:       GET /markets (status=open, mve_filter=exclude, activity filter)
+  Live:       GET /markets (status=open) twice — mve_filter=exclude then only
   Historical: GET /historical/markets
 
 Step 3 — Fetch candlestick data per market
   Live batch: GET /markets/candlesticks (market_tickers + start_ts + end_ts)
   Historical: GET /historical/markets/{ticker}/candlesticks
-  Intraday (<24h) → 1-min candles; otherwise daily
+  Period: 1-min for sports / high-volume / short-lived (chunked ≤10k candles);
+          daily otherwise. If recovered volume ≪ listing volume → re-fetch 1-min,
+          then fall back to GET /markets/trades pagination for exact fill fees.
 
-Step 4 — Compute fee per candle, accumulate daily time series
+Step 4 — Compute fee per candle (or trade), accumulate daily time series
   Price: candle mean_dollars (mean traded YES price); fee from contract_fees()
   fee_type=quadratic → taker only; quadratic_with_maker_fees → taker + maker
   Per-series schedule applied by candle end_period_ts (not a global calendar cut)
@@ -105,12 +107,17 @@ MAX_PAGES = 2000
 REQUEST_TIMEOUT = 45
 CANDLE_TIMEOUT = 90
 MAX_RETRIES = 5
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2  # v2: 1-min sports/high-vol, trade fallback, MVE live pass
 CHECKPOINT_EVERY = 200
 CANDLE_BATCH_SIZE = 25
 LIVE_PROCESS_CHUNK = 200
 MIN_EXPECTED_MARKETS = 150_000
 MIN_EXPECTED_DATE_SPAN = 30
+MAX_CANDLES_PER_REQUEST = 10_000
+HIGH_VOLUME_ONE_MIN = 5_000.0
+VOLUME_RECOVERY_RATIO = 0.5
+VOLUME_RECOVERY_MIN_LISTING = 500.0
+TRADE_FALLBACK_MAX_PAGES = 500
 
 # ── Fee constants (Kalshi fee schedule: 0.07 × C × P × (1-P), maker = 25% of taker) ─
 STANDARD_TAKER = 0.07
@@ -433,15 +440,64 @@ def candle_fee(candle: dict, series: str, candle_dt: datetime,
 
 # ── Candle period / intraday detection ───────────────────────────────────────
 
-def is_intraday(open_time: str, close_time: str) -> bool:
+def series_ticker_of(market: dict | str, series_ticker: str = "") -> str:
+    """
+    Prefer API series_ticker; MVE/combo markets often omit it — derive from ticker prefix.
+    """
+    if isinstance(market, dict):
+        ticker = market.get("ticker", "") or ""
+        series = (market.get("series_ticker") or series_ticker or "").strip()
+    else:
+        ticker = market or ""
+        series = (series_ticker or "").strip()
+    if series:
+        return series.upper()
+    return (ticker.split("-")[0] if ticker else "").upper()
+
+
+def market_duration_hours(open_time: str, close_time: str) -> float | None:
     o = parse_iso(open_time)
     c = parse_iso(close_time)
     if not o or not c:
-        return False
-    return 0 < (c - o).total_seconds() / 3600 < INTRADAY_HOURS
+        return None
+    return (c - o).total_seconds() / 3600.0
 
-def candle_period(open_time: str, close_time: str) -> int:
-    return 1 if is_intraday(open_time, close_time) else 1440
+
+def is_intraday(open_time: str, close_time: str) -> bool:
+    hours = market_duration_hours(open_time, close_time)
+    return hours is not None and 0 < hours < INTRADAY_HOURS
+
+
+def choose_candle_period(open_time: str, close_time: str,
+                         category: str = "", listing_vol: float = 0.0,
+                         ticker: str = "") -> int:
+    """
+    Daily (1440) candles systematically under-recover volume on multi-day sports
+    and other high-activity markets (e.g. ~965 contracts on daily vs ~1.8M on 1-min).
+    Prefer 1-min whenever under-recovery is likely; chunk long ranges below.
+    """
+    hours = market_duration_hours(open_time, close_time)
+    if hours is not None and 0 < hours < INTRADAY_HOURS:
+        return 1
+    cat = categorize(ticker, category) if (ticker or category) else (category or "").lower()
+    if cat == "sports":
+        return 1
+    series = series_ticker_of(ticker)
+    if any(series.startswith(p) for p in MVE_SPORTS_MAKER_PREFIXES):
+        return 1
+    if listing_vol >= HIGH_VOLUME_ONE_MIN:
+        return 1
+    # Multi-day but not huge: still prefer 1-min when listing volume is material
+    if hours is not None and hours < 24 * 14 and listing_vol >= 1_000:
+        return 1
+    return 1440
+
+
+def candle_period(open_time: str, close_time: str,
+                  category: str = "", listing_vol: float = 0.0,
+                  ticker: str = "") -> int:
+    return choose_candle_period(open_time, close_time, category, listing_vol, ticker)
+
 
 def candle_time_params(open_time: str = "", close_time: str = "",
                        cap_end_to_now: bool = False) -> dict[str, int]:
@@ -457,6 +513,22 @@ def candle_time_params(open_time: str = "", close_time: str = "",
         end = start + 3600
     return {"start_ts": start, "end_ts": end}
 
+
+def max_candle_span_seconds(period: int) -> int:
+    """API returns at most ~10k candles per request; span = count × period minutes."""
+    return MAX_CANDLES_PER_REQUEST * max(int(period), 1) * 60
+
+
+def candle_volume_sum(candles: list) -> float:
+    return sum(float(c.get("volume_fp") or c.get("volume") or 0) for c in candles)
+
+
+def needs_volume_recovery(candle_vol: float, listing_vol: float) -> bool:
+    if listing_vol < VOLUME_RECOVERY_MIN_LISTING:
+        return False
+    return candle_vol < listing_vol * VOLUME_RECOVERY_RATIO
+
+
 def market_has_activity(market: dict) -> bool:
     for field in ("volume_fp", "volume_24h_fp", "open_interest_fp", "volume", "volume_24h"):
         val = market.get(field)
@@ -465,26 +537,92 @@ def market_has_activity(market: dict) -> bool:
     return False
 
 
+def _fetch_candles_chunked(path: str, period: int, open_time: str, close_time: str,
+                           cap_end_to_now: bool = False) -> list:
+    """Fetch candlesticks, splitting long ranges so each request stays under the API cap."""
+    bounds = candle_time_params(open_time, close_time, cap_end_to_now=cap_end_to_now)
+    start_ts, end_ts = bounds["start_ts"], bounds["end_ts"]
+    span = max_candle_span_seconds(period)
+    all_candles: list = []
+    t = start_ts
+    first = True
+    while t < end_ts:
+        chunk_end = min(t + span, end_ts)
+        params = {
+            "period_interval": period,
+            "start_ts": t,
+            "end_ts": chunk_end,
+        }
+        if not first:
+            time.sleep(DELAY)
+        data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
+        all_candles.extend(data.get("candlesticks", []))
+        t = chunk_end
+        first = False
+    return all_candles
+
+
 # ── Candlestick fetchers ──────────────────────────────────────────────────────
 
 def fetch_candles_live(series_ticker: str, market_ticker: str,
-                       open_time: str = "", close_time: str = "") -> list:
-    period = candle_period(open_time, close_time)
-    path   = f"/series/{series_ticker}/markets/{market_ticker}/candlesticks"
-    params = {
-        "period_interval": period,
-        **candle_time_params(open_time, close_time, cap_end_to_now=True),
-    }
-    data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
-    return data.get("candlesticks", [])
+                       open_time: str = "", close_time: str = "",
+                       period: int | None = None,
+                       category: str = "", listing_vol: float = 0.0) -> list:
+    if period is None:
+        period = choose_candle_period(
+            open_time, close_time, category, listing_vol, market_ticker
+        )
+    path = f"/series/{series_ticker}/markets/{market_ticker}/candlesticks"
+    return _fetch_candles_chunked(path, period, open_time, close_time, cap_end_to_now=True)
+
 
 def fetch_candles_historical(market_ticker: str,
-                              open_time: str = "", close_time: str = "") -> list:
-    period = candle_period(open_time, close_time)
-    path   = f"/historical/markets/{market_ticker}/candlesticks"
-    params = {"period_interval": period, **candle_time_params(open_time, close_time)}
-    data = get(path, params, timeout=CANDLE_TIMEOUT) or {}
-    return data.get("candlesticks", [])
+                              open_time: str = "", close_time: str = "",
+                              period: int | None = None,
+                              category: str = "", listing_vol: float = 0.0) -> list:
+    if period is None:
+        period = choose_candle_period(
+            open_time, close_time, category, listing_vol, market_ticker
+        )
+    path = f"/historical/markets/{market_ticker}/candlesticks"
+    return _fetch_candles_chunked(path, period, open_time, close_time, cap_end_to_now=False)
+
+
+def fetch_all_trades(market_ticker: str, open_time: str = "", close_time: str = "",
+                     max_pages: int = TRADE_FALLBACK_MAX_PAGES) -> list:
+    """Paginate GET /markets/trades for exact fill-level volume and fees."""
+    params: dict = {"ticker": market_ticker, "limit": 1000}
+    bounds = candle_time_params(open_time, close_time) if (open_time or close_time) else None
+    # Filter client-side when API omits time bounds; still pass if supported.
+    if bounds:
+        params["min_ts"] = bounds["start_ts"]
+        params["max_ts"] = bounds["end_ts"]
+
+    trades: list = []
+    cursor = ""
+    pages = 0
+    while pages < max_pages:
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        data = get("/markets/trades", page_params, timeout=REQUEST_TIMEOUT)
+        if data is None:
+            # Retry without time filters if API rejects them
+            if pages == 0 and ("min_ts" in params or "max_ts" in params):
+                params.pop("min_ts", None)
+                params.pop("max_ts", None)
+                continue
+            break
+        items = data.get("trades", [])
+        if not items:
+            break
+        trades.extend(items)
+        cursor = data.get("cursor", "") or ""
+        pages += 1
+        if not cursor:
+            break
+        time.sleep(DELAY)
+    return trades
 
 def _market_open_ts(meta: dict) -> int:
     o = parse_iso(meta.get("open_time", ""))
@@ -538,7 +676,10 @@ def _fetch_candle_batch(chunk: list[str], period: int,
             series = meta.get("series_ticker", "")
             if series:
                 return {ticker: fetch_candles_live(
-                    series, ticker, meta.get("open_time", ""), meta.get("close_time", "")
+                    series, ticker,
+                    meta.get("open_time", ""), meta.get("close_time", ""),
+                    category=meta.get("category", ""),
+                    listing_vol=float(meta.get("listing_volume") or 0),
                 )}
             print(f"    [warn] batch candle fetch failed for {ticker}", flush=True)
         return {}
@@ -555,11 +696,20 @@ def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
     """
     Batch endpoint with small chunks. Split by period (1 vs 1440) because
     period_interval is a single parameter for the whole batch.
+    Sports / high-volume markets use 1-min (not open→close duration alone).
     """
-    intraday = [t for t, m in ticker_meta.items()
-                if is_intraday(m.get("open_time", ""), m.get("close_time", ""))]
-    multiday = [t for t in ticker_meta if t not in intraday]
-    result   = {}
+    one_min: list[str] = []
+    daily: list[str] = []
+    for t, m in ticker_meta.items():
+        period = choose_candle_period(
+            m.get("open_time", ""),
+            m.get("close_time", ""),
+            m.get("category", ""),
+            float(m.get("listing_volume") or 0),
+            t,
+        )
+        (one_min if period == 1 else daily).append(t)
+    result: dict[str, list] = {}
 
     def _batch(tickers: list[str], period: int):
         by_quarter: dict[tuple[int, int], list[str]] = defaultdict(list)
@@ -572,12 +722,12 @@ def batch_fetch_candles_live(ticker_meta: dict[str, dict]) -> dict[str, list]:
                 result.update(_fetch_candle_batch(chunk, period, ticker_meta))
                 time.sleep(DELAY)
 
-    if intraday:
-        print(f"       {len(intraday):,} intraday markets → 1-min candles", flush=True)
-        _batch(intraday, 1)
-    if multiday:
-        print(f"       {len(multiday):,} multi-day markets → daily candles", flush=True)
-        _batch(multiday, 1440)
+    if one_min:
+        print(f"       {len(one_min):,} markets → 1-min candles (sports/high-vol/short)", flush=True)
+        _batch(one_min, 1)
+    if daily:
+        print(f"       {len(daily):,} markets → daily candles", flush=True)
+        _batch(daily, 1440)
 
     return result
 
@@ -590,6 +740,7 @@ TICKER_CATEGORY = {
     "KXWC":"sports",    "KXUFC":"sports",    "KXNASCAR":"sports",
     "KXPGA":"sports",   "KXBIG":"sports",    "KXCHAMP":"sports",
     "KXMLS":"sports",   "KXCFL":"sports",    "KXATP":"sports",
+    "KXMVE":"sports",   "KXMVESPORTS":"sports",
     "FED":"economics",  "KXFED":"economics", "KXCPI":"economics",
     "KXGDP":"economics","KXUNEMPLOYMENT":"economics","KXJOBS":"economics",
     "INX":"economics",  "NASDAQ100":"economics","KXEGGS":"economics",
@@ -605,6 +756,8 @@ def categorize(ticker: str, api_category: str = "") -> str:
     if api_category and api_category.strip().lower() not in ("", "unknown"):
         return api_category.strip().lower()
     s = ticker.split("-")[0].upper()
+    if any(s.startswith(p) for p in MVE_SPORTS_MAKER_PREFIXES) or s.startswith("KXMVE"):
+        return "sports"
     for prefix, cat in TICKER_CATEGORY.items():
         if s.startswith(prefix):
             return cat
@@ -647,6 +800,29 @@ def accumulate_candles(candles: list, series: str, category: str,
             total_fee       += fee
             daily_series[date_str][category] += fee
 
+    return total_contracts, total_fee
+
+
+def accumulate_trades(trades: list, series: str, category: str,
+                      fee_changes: dict, daily_series: dict,
+                      min_date: str | None):
+    """Accumulate exact fill fees from GET /markets/trades into daily_series."""
+    total_contracts = 0.0
+    total_fee = 0.0
+    for trade in trades:
+        created = parse_iso(trade.get("created_time", "") or "")
+        if not created:
+            continue
+        date_str = created.strftime("%Y-%m-%d")
+        if min_date and date_str < min_date:
+            continue
+        count = float(trade.get("count_fp") or trade.get("count") or 0)
+        fee = trade_fee(trade, series, fee_changes)
+        if count <= 0:
+            continue
+        total_contracts += count
+        total_fee += fee
+        daily_series[date_str][category] += fee
     return total_contracts, total_fee
 
 
@@ -713,6 +889,80 @@ def save_checkpoint(path: str | None, state: dict):
     print(f"  [checkpoint] saved → {checkpoint_path}", flush=True)
 
 
+def _recover_market_activity(
+    ticker: str,
+    series: str,
+    category: str,
+    open_time: str,
+    close_time: str,
+    listing_vol: float,
+    fee_changes: dict,
+    daily_series: dict,
+    min_date: str | None,
+    *,
+    live: bool = False,
+    initial_candles: list | None = None,
+    initial_period: int | None = None,
+) -> tuple[float, float, bool]:
+    """
+    Candles → optional 1-min re-fetch → trades fallback.
+    Returns (contracts, fee, no_usable_data).
+    """
+    period = initial_period
+    if period is None:
+        period = choose_candle_period(open_time, close_time, category, listing_vol, ticker)
+
+    candles = list(initial_candles or [])
+    if not candles:
+        if live and series:
+            candles = fetch_candles_live(
+                series, ticker, open_time, close_time,
+                period=period, category=category, listing_vol=listing_vol,
+            )
+        else:
+            candles = fetch_candles_historical(
+                ticker, open_time, close_time,
+                period=period, category=category, listing_vol=listing_vol,
+            )
+        time.sleep(DELAY)
+
+    vol = candle_volume_sum(candles)
+    if needs_volume_recovery(vol, listing_vol) and period != 1:
+        if live and series:
+            candles = fetch_candles_live(
+                series, ticker, open_time, close_time,
+                period=1, category=category, listing_vol=listing_vol,
+            )
+        else:
+            candles = fetch_candles_historical(
+                ticker, open_time, close_time,
+                period=1, category=category, listing_vol=listing_vol,
+            )
+        time.sleep(DELAY)
+        vol = candle_volume_sum(candles)
+        period = 1
+
+    if needs_volume_recovery(vol, listing_vol) or not candles or vol <= 0:
+        trades = fetch_all_trades(ticker, open_time, close_time)
+        time.sleep(DELAY)
+        if trades:
+            contracts, fee = accumulate_trades(
+                trades, series, category, fee_changes, daily_series, min_date
+            )
+            if contracts > 0:
+                return contracts, fee, False
+
+    if not candles:
+        return 0.0, 0.0, True
+
+    contracts, fee = accumulate_candles(
+        candles, series, category, fee_changes, daily_series, min_date
+    )
+    if contracts == 0:
+        return 0.0, 0.0, True
+    return contracts, fee, False
+
+
 def _process_one_market(m: dict, fee_changes: dict, daily_series: dict,
                         min_date: str | None) -> tuple[float, float, bool, bool]:
     """Returns (contracts, fee, skipped_zero_vol, no_candles)."""
@@ -724,20 +974,17 @@ def _process_one_market(m: dict, fee_changes: dict, daily_series: dict,
     if min_date and close_time and close_time[:10] < min_date:
         return 0.0, 0.0, False, False
 
-    if listing_volume(m) <= 0:
+    listing = listing_volume(m)
+    if listing <= 0:
         return 0.0, 0.0, True, False
 
-    candles = fetch_candles_historical(ticker, open_time, close_time)
-    time.sleep(DELAY)
-    if not candles:
-        return 0.0, 0.0, False, True
-
-    series = (m.get("series_ticker") or ticker.split("-")[0]).upper()
+    series = series_ticker_of(m)
     category = categorize(ticker, api_cat)
-    contracts, fee = accumulate_candles(
-        candles, series, category, fee_changes, daily_series, min_date
+    contracts, fee, missing = _recover_market_activity(
+        ticker, series, category, open_time, close_time, listing,
+        fee_changes, daily_series, min_date, live=False,
     )
-    if contracts == 0:
+    if missing:
         return 0.0, 0.0, False, True
     return contracts, fee, False, False
 
@@ -798,23 +1045,30 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
     elif checkpoint.get("live_complete"):
         print("\n  [A1] Live markets already complete (checkpoint).")
     else:
-        print("\n  [A1] Fetching live markets with activity…")
+        print("\n  [A1] Fetching live markets with activity (binary + MVE)…")
         live_markets = {}
         scanned = 0
-        for m in paginate("/markets", "markets", {"status": "open", "mve_filter": "exclude"}):
-            scanned += 1
-            ticker = m.get("ticker")
-            if ticker and market_has_activity(m):
-                live_markets[ticker] = m
+        # Dual pass: exclude alone drops parlays/MVE — a large sports fee slice.
+        for mve_filter in ("exclude", "only"):
+            for m in paginate(
+                "/markets", "markets",
+                {"status": "open", "mve_filter": mve_filter},
+            ):
+                scanned += 1
+                ticker = m.get("ticker")
+                if ticker and market_has_activity(m):
+                    live_markets[ticker] = m
         print(f"       {len(live_markets):,} active open markets (scanned {scanned:,})")
 
         live_meta = {}
         for m in live_markets.values():
-            live_meta[m["ticker"]] = {
-                "series_ticker": m.get("series_ticker", ""),
+            ticker = m["ticker"]
+            live_meta[ticker] = {
+                "series_ticker": series_ticker_of(m),
                 "category":      m.get("category", ""),
                 "open_time":     m.get("open_time", ""),
                 "close_time":    m.get("close_time", ""),
+                "listing_volume": listing_volume(m),
             }
 
         sorted_tickers = sorted(live_meta.keys())
@@ -832,22 +1086,31 @@ def process_event_contracts(fee_changes: dict, min_date: str | None,
 
             for ticker in chunk_tickers:
                 meta = live_meta[ticker]
-                candles = candle_map.get(ticker, [])
-                if not candles and meta["series_ticker"]:
-                    candles = fetch_candles_live(meta["series_ticker"], ticker,
-                                                 meta["open_time"], meta["close_time"])
-                    time.sleep(DELAY)
-
-                if not candles:
-                    no_candles += 1
-                    continue
-
-                series   = (meta.get("series_ticker") or ticker.split("-")[0]).upper()
-                category = categorize(ticker, meta["category"])
-                contracts, fee = accumulate_candles(
-                    candles, series, category, fee_changes, daily_series, min_date
+                series = series_ticker_of(ticker, meta.get("series_ticker", ""))
+                category = categorize(ticker, meta.get("category", ""))
+                listing = float(meta.get("listing_volume") or 0)
+                period = choose_candle_period(
+                    meta.get("open_time", ""),
+                    meta.get("close_time", ""),
+                    category,
+                    listing,
+                    ticker,
                 )
-                if contracts == 0:
+                contracts, fee, missing = _recover_market_activity(
+                    ticker,
+                    series,
+                    category,
+                    meta.get("open_time", ""),
+                    meta.get("close_time", ""),
+                    listing,
+                    fee_changes,
+                    daily_series,
+                    min_date,
+                    live=True,
+                    initial_candles=candle_map.get(ticker, []),
+                    initial_period=period,
+                )
+                if missing:
                     no_candles += 1
                     continue
 
